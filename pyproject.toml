@@ -3,6 +3,7 @@ name = "async-rl-lab"
 version = "0.1.0"
 description = "Mini async GRPO-family RL lab for LLM and agentic systems"
 readme = "README.md"
+license = { text = "MIT" }
 authors = [
     { name = "ydnysh", email = "yadnyesh.g.c@gmail.com" }
 ]
