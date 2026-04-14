@@ -1,0 +1,17 @@
+[project]
+name = "async-rl-lab"
+version = "0.1.0"
+description = "Mini async GRPO-family RL lab for LLM and agentic systems"
+readme = "README.md"
+authors = [
+    { name = "ydnysh", email = "yadnyesh.g.c@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+async-rl-demo = "async_rl_lab.demo:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
