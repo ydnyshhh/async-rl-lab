@@ -274,16 +274,20 @@ async def learner_main_loop(
     event_logger: JsonlEventLogger,
     stop_event: asyncio.Event,
     config: LearnerConfig,
-    max_steps: int = 2,
+    max_steps: int | None = None,
 ) -> list[LearnerStepResult]:
     results: list[LearnerStepResult] = []
     learner_step = 0
-    while not stop_event.is_set() and learner_step < max_steps:
+    while True:
+        if max_steps is not None and learner_step >= max_steps:
+            break
         batch = rollout_buffer.sample_groups(
             max_groups=config.max_groups_per_batch,
             learner_policy_version=policy_store.current_policy().policy_version,
         )
         if batch is None:
+            if stop_event.is_set() and rollout_buffer.group_count() == 0:
+                break
             await asyncio.sleep(0.05)
             continue
 
@@ -347,7 +351,6 @@ async def learner_main_loop(
             payload=result.to_dict(),
         )
 
-    stop_event.set()
     return results
 
 

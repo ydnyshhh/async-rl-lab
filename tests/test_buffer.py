@@ -96,3 +96,15 @@ class BufferTests(unittest.TestCase):
         self.assertEqual(batch.group_ids, ("group-a",))
         self.assertEqual(len(batch.trajectories), 2)
         self.assertTrue(all(t.learner_consume_ts is not None for t in batch.trajectories))
+
+    def test_drop_most_stale_prefers_old_behavior_policy(self) -> None:
+        buffer = InMemoryGroupedRolloutBuffer(
+            capacity_groups=2,
+            required_group_size=2,
+            drop_policy="drop_most_stale",
+        )
+        buffer.insert_group((make_trajectory("group-a", 0, 0), make_trajectory("group-a", 1, 0)))
+        buffer.insert_group((make_trajectory("group-b", 0, 2), make_trajectory("group-b", 1, 2)))
+        result = buffer.insert_group((make_trajectory("group-c", 0, 3), make_trajectory("group-c", 1, 3)))
+        self.assertEqual(result.dropped_group_ids, ("group-a",))
+        self.assertEqual(tuple(buffer.group_order), ("group-b", "group-c"))

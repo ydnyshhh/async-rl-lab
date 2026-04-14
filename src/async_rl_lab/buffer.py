@@ -172,7 +172,11 @@ class InMemoryGroupedRolloutBuffer:
     def drop_one_group(self) -> str:
         if self.drop_policy not in {"fifo", "drop_oldest", "drop_most_stale"}:
             raise ValueError(f"unsupported drop policy: {self.drop_policy}")
-        group_id = self.group_order.popleft()
+        if self.drop_policy in {"fifo", "drop_oldest"}:
+            group_id = self.group_order.popleft()
+        else:
+            group_id = self.select_most_stale_group()
+            self.group_order.remove(group_id)
         self.remove_group(group_id)
         return group_id
 
@@ -180,3 +184,31 @@ class InMemoryGroupedRolloutBuffer:
         if trajectory.queue_insert_ts is None:
             return 0.0
         return max(0.0, (now_ts - trajectory.queue_insert_ts) * 1000.0)
+
+    def select_most_stale_group(self) -> str:
+        if not self.group_order:
+            raise ValueError("cannot select from an empty buffer")
+        latest_behavior_version = max(
+            (
+                trajectory.behavior_policy_version
+                for group in self.groups.values()
+                for trajectory in group
+            ),
+            default=0,
+        )
+        now_ts = utc_ts()
+        return max(
+            self.group_order,
+            key=lambda group_id: self.group_staleness_key(
+                group_id=group_id,
+                latest_behavior_version=latest_behavior_version,
+                now_ts=now_ts,
+            ),
+        )
+
+    def group_staleness_key(self, *, group_id: str, latest_behavior_version: int, now_ts: float) -> tuple[float, float]:
+        group = self.groups[group_id]
+        min_behavior_version = min(trajectory.behavior_policy_version for trajectory in group)
+        max_age_ms = max(self.age_ms(trajectory, now_ts) for trajectory in group)
+        policy_lag = float(latest_behavior_version - min_behavior_version)
+        return (policy_lag, max_age_ms)
