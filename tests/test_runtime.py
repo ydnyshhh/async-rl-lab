@@ -19,7 +19,7 @@ class RuntimeLoopTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             policy_store = LocalPolicyStore(root, run_id="run-test")
-            inference_engine = MockInferenceEngine(policy_store.current_policy())
+            inference_engine = MockInferenceEngine(policy_store.current_policy(), policy_store=policy_store)
             buffer = InMemoryGroupedRolloutBuffer(capacity_groups=2, required_group_size=2)
             buffer.insert_group((make_trajectory("group-a", 0, 0), make_trajectory("group-a", 1, 0)))
             logger = JsonlEventLogger(root / "events.jsonl", run_id="run-test")
@@ -44,7 +44,7 @@ class RuntimeLoopTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             policy_store = LocalPolicyStore(root, run_id="run-test")
-            inference_engine = MockInferenceEngine(policy_store.current_policy())
+            inference_engine = MockInferenceEngine(policy_store.current_policy(), policy_store=policy_store)
             buffer = InMemoryGroupedRolloutBuffer(capacity_groups=4, required_group_size=2)
             buffer.insert_group((make_trajectory("group-a", 0, 0), make_trajectory("group-a", 1, 0)))
             buffer.insert_group((make_trajectory("group-b", 0, 0), make_trajectory("group-b", 1, 0)))
@@ -65,3 +65,35 @@ class RuntimeLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(results), 1)
             self.assertFalse(stop_event.is_set())
             self.assertEqual(buffer.group_count(), 1)
+
+    async def test_learner_updates_published_policy_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            policy_store = LocalPolicyStore(root, run_id="run-test")
+            inference_engine = MockInferenceEngine(policy_store.current_policy(), policy_store=policy_store)
+            buffer = InMemoryGroupedRolloutBuffer(capacity_groups=2, required_group_size=2)
+            buffer.insert_group(
+                (
+                    make_trajectory("group-a", 0, 0, reward=1.0, answer_text="4"),
+                    make_trajectory("group-a", 1, 0, reward=0.0, answer_text="5"),
+                )
+            )
+            logger = JsonlEventLogger(root / "events.jsonl", run_id="run-test")
+            stop_event = asyncio.Event()
+            stop_event.set()
+
+            results = await learner_main_loop(
+                objective=GRPOObjective(),
+                rollout_buffer=buffer,
+                policy_store=policy_store,
+                inference_engine=inference_engine,
+                event_logger=logger,
+                stop_event=stop_event,
+                config=LearnerConfig(max_groups_per_batch=1, publish_every_steps=1, learning_rate=0.1),
+                max_steps=None,
+            )
+
+            self.assertEqual(len(results), 1)
+            self.assertEqual(policy_store.current_policy().policy_version, 1)
+            self.assertGreater(results[0].gradient_norm or 0.0, 0.0)
+            self.assertGreater(len(policy_store.current_state_snapshot().token_logits), 0)

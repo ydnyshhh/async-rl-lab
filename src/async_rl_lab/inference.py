@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 import json
+import math
+import random
 from typing import Protocol
 
 from async_rl_lab.ids import make_id, utc_ts
+from async_rl_lab.metrics import MetricsSnapshot, MetricsStore
 from async_rl_lab.models import Action, GenerationRequest, GenerationResult, PolicyRef, ToolCall
+from async_rl_lab.policy_store import LocalPolicyStore, SequencePolicyState
 
 
 class InferenceEngine(Protocol):
@@ -24,6 +29,9 @@ class InferenceEngine(Protocol):
         ...
 
     def current_policy(self) -> PolicyRef:
+        ...
+
+    def metrics_snapshot(self) -> MetricsSnapshot:
         ...
 
     async def close(self) -> None:
@@ -108,19 +116,25 @@ class MockInferenceEngine:
         self,
         initial_policy: PolicyRef,
         *,
+        policy_store: LocalPolicyStore | None = None,
         batch_window_ms: float = 10.0,
         max_batch_size: int = 16,
         artificial_latency_ms: float = 25.0,
     ) -> None:
         self.loaded_policy = initial_policy
+        self.policy_store = policy_store
+        self.loaded_state: SequencePolicyState | None = None
         self.batch_window_ms = batch_window_ms
         self.max_batch_size = max_batch_size
         self.artificial_latency_ms = artificial_latency_ms
         self.pending_queue: asyncio.Queue[PendingGeneration] = asyncio.Queue()
         self.stop_event = asyncio.Event()
         self.worker_task: asyncio.Task[None] | None = None
+        self.metrics = MetricsStore()
+        self.last_refresh_latency_ms = 0.0
 
     async def start(self) -> None:
+        await self.ensure_policy_loaded(self.loaded_policy)
         if self.worker_task is None:
             self.worker_task = asyncio.create_task(self.batch_worker())
 
@@ -128,6 +142,8 @@ class MockInferenceEngine:
         if self.worker_task is None:
             await self.start()
         future: asyncio.Future[GenerationResult] = asyncio.get_running_loop().create_future()
+        self.metrics.increment("inference.requests")
+        self.metrics.observe("inference.pending_queue_depth", float(self.pending_queue.qsize() + 1))
         await self.pending_queue.put(PendingGeneration(request=request, future=future, enqueue_ts=utc_ts()))
         return await future
 
@@ -136,11 +152,13 @@ class MockInferenceEngine:
         return list(results)
 
     async def refresh_policy(self, policy: PolicyRef) -> None:
-        await asyncio.sleep(self.artificial_latency_ms / 1000.0)
-        self.loaded_policy = policy
+        self.last_refresh_latency_ms = await self.ensure_policy_loaded(policy)
 
     def current_policy(self) -> PolicyRef:
         return self.loaded_policy
+
+    def metrics_snapshot(self) -> MetricsSnapshot:
+        return self.metrics.snapshot()
 
     async def close(self) -> None:
         self.stop_event.set()
@@ -159,17 +177,36 @@ class MockInferenceEngine:
             while len(batch) < self.max_batch_size and not self.pending_queue.empty():
                 batch.append(self.pending_queue.get_nowait())
 
-            await self.process_batch(batch)
+            for policy_batch in self.partition_batch_by_policy(batch):
+                await self.process_batch(policy_batch)
 
     async def process_batch(self, batch: list[PendingGeneration]) -> None:
+        dispatch_ts = utc_ts()
+        policy_ref = batch[0].request.policy
+        policy_load_latency_ms = await self.ensure_policy_loaded(policy_ref)
         started_ts = utc_ts()
+        self.metrics.increment("inference.batches")
+        self.metrics.observe("inference.batch_size", float(len(batch)))
         await asyncio.sleep(self.artificial_latency_ms / 1000.0)
         for pending in batch:
             generated_text = self.generate_text(pending.request)
             action = parse_action_text(generated_text)
+            score = self.score_generated_text(generated_text)
             ended_ts = utc_ts()
             prompt_tokens = max(1, len(pending.request.observation_text.split()))
-            completion_tokens = max(1, len(generated_text.split()))
+            completion_tokens = max(1, len(score.token_logprobs) or len(generated_text.split()))
+            queue_wait_ms = (dispatch_ts - pending.enqueue_ts) * 1000.0
+            latency_ms = (ended_ts - dispatch_ts) * 1000.0
+            self.metrics.observe("inference.queue_wait_ms", queue_wait_ms)
+            self.metrics.observe("inference.latency_ms", latency_ms)
+            self.metrics.observe("inference.prompt_tokens", float(prompt_tokens))
+            self.metrics.observe("inference.completion_tokens", float(completion_tokens))
+            self.metrics.observe(
+                "inference.tokens_per_second",
+                (prompt_tokens + completion_tokens) / max(ended_ts - started_ts, 1e-6),
+            )
+            if action.action_type == "invalid":
+                self.metrics.increment("inference.invalid_action_count")
             result = GenerationResult(
                 result_id=make_id("gen"),
                 request_id=pending.request.request_id,
@@ -188,10 +225,16 @@ class MockInferenceEngine:
                 completion_tokens=completion_tokens,
                 total_tokens=prompt_tokens + completion_tokens,
                 parser_status=action.parser_status,
-                queue_wait_ms=(started_ts - pending.enqueue_ts) * 1000.0,
-                latency_ms=(ended_ts - started_ts) * 1000.0,
+                queue_wait_ms=queue_wait_ms,
+                latency_ms=latency_ms,
                 action=action,
-                metadata={"engine_policy_version": self.loaded_policy.policy_version},
+                token_logprobs=score.token_logprobs,
+                metadata={
+                    "engine_policy_version": self.loaded_policy.policy_version,
+                    "served_policy_version": policy_ref.policy_version,
+                    "policy_load_latency_ms": policy_load_latency_ms,
+                    "batch_size": len(batch),
+                },
             )
             if not pending.future.done():
                 pending.future.set_result(result)
@@ -200,25 +243,86 @@ class MockInferenceEngine:
         if "forced_output" in request.metadata:
             return str(request.metadata["forced_output"])
 
+        candidates = self.build_candidates(request)
+        if len(candidates) == 1:
+            return candidates[0]
+        if self.policy_store is None or self.loaded_state is None:
+            return candidates[0]
+
+        scores = [self.policy_store.score_text(candidate, state=self.loaded_state) for candidate in candidates]
+        score_values = [score.mean_logprob for score in scores]
+        temperature = max(request.temperature, 1e-4)
+        if temperature <= 1e-3:
+            best_index = max(range(len(candidates)), key=score_values.__getitem__)
+            return candidates[best_index]
+
+        weights = softmax_scores(score_values, temperature=temperature)
+        seed = request.seed if request.seed is not None else stable_request_seed(request)
+        random_state = random.Random(seed)
+        selected_index = random_state.choices(range(len(candidates)), weights=weights, k=1)[0]
+        return candidates[selected_index]
+
+    def build_candidates(self, request: GenerationRequest) -> list[str]:
         gold_answer = request.metadata.get("gold_answer")
         expression = request.metadata.get("expression")
-        if expression and "calculator" in request.available_tools and request.sample_index_within_group % 2 == 0:
-            return json.dumps(
-                {
-                    "type": "tool_call",
-                    "tool_name": "calculator",
-                    "arguments": {"expression": str(expression)},
-                }
+        candidates: list[str] = []
+        if expression and "calculator" in request.available_tools:
+            candidates.append(
+                json.dumps(
+                    {
+                        "type": "tool_call",
+                        "tool_name": "calculator",
+                        "arguments": {"expression": str(expression)},
+                    }
+                )
             )
         if gold_answer is not None:
-            answer = str(gold_answer) if request.sample_index_within_group % 3 == 0 else f"{gold_answer}?"
-            return json.dumps({"type": "finish", "answer": answer})
-        return json.dumps({"type": "finish", "answer": request.observation_text[:32]})
+            candidates.append(json.dumps({"type": "finish", "answer": str(gold_answer)}))
+            candidates.append(json.dumps({"type": "finish", "answer": f"{gold_answer}?"}))
+            candidates.append(json.dumps({"type": "finish", "answer": request.observation_text[:16]}))
+        else:
+            candidates.append(json.dumps({"type": "finish", "answer": request.observation_text[:32]}))
+        deduped: list[str] = []
+        for candidate in candidates:
+            if candidate not in deduped:
+                deduped.append(candidate)
+        return deduped
+
+    def score_generated_text(self, generated_text: str):
+        if self.policy_store is None or self.loaded_state is None:
+            token_count = max(1, len(generated_text.split()))
+            return type("FallbackScore", (), {"token_logprobs": tuple(-1.0 for _ in range(token_count))})()
+        return self.policy_store.score_text(generated_text, state=self.loaded_state)
+
+    async def ensure_policy_loaded(self, policy: PolicyRef) -> float:
+        if self.loaded_policy.policy_version == policy.policy_version and self.loaded_state is not None:
+            return 0.0
+        started_ts = utc_ts()
+        await asyncio.sleep(self.artificial_latency_ms / 1000.0)
+        if self.policy_store is not None:
+            self.loaded_state = self.policy_store.load_policy_state(policy.policy_version)
+        self.loaded_policy = policy
+        ended_ts = utc_ts()
+        latency_ms = (ended_ts - started_ts) * 1000.0
+        self.metrics.increment("inference.policy_refresh_count")
+        self.metrics.observe("inference.policy_refresh_latency_ms", latency_ms)
+        return latency_ms
+
+    def partition_batch_by_policy(self, batch: list[PendingGeneration]) -> list[list[PendingGeneration]]:
+        buckets: dict[int, list[PendingGeneration]] = defaultdict(list)
+        order: list[int] = []
+        for pending in batch:
+            policy_version = pending.request.policy.policy_version
+            if policy_version not in buckets:
+                order.append(policy_version)
+            buckets[policy_version].append(pending)
+        return [buckets[policy_version] for policy_version in order]
 
 
 class HFInferenceEngine:
     def __init__(self, initial_policy: PolicyRef) -> None:
         self.loaded_policy = initial_policy
+        self.metrics = MetricsStore()
 
     async def start(self) -> None:
         return None
@@ -235,6 +339,9 @@ class HFInferenceEngine:
     def current_policy(self) -> PolicyRef:
         return self.loaded_policy
 
+    def metrics_snapshot(self) -> MetricsSnapshot:
+        return self.metrics.snapshot()
+
     async def close(self) -> None:
         return None
 
@@ -242,6 +349,7 @@ class HFInferenceEngine:
 class VLLMInferenceEngine:
     def __init__(self, initial_policy: PolicyRef) -> None:
         self.loaded_policy = initial_policy
+        self.metrics = MetricsStore()
 
     async def start(self) -> None:
         return None
@@ -258,5 +366,22 @@ class VLLMInferenceEngine:
     def current_policy(self) -> PolicyRef:
         return self.loaded_policy
 
+    def metrics_snapshot(self) -> MetricsSnapshot:
+        return self.metrics.snapshot()
+
     async def close(self) -> None:
         return None
+
+
+def softmax_scores(values: Sequence[float], *, temperature: float) -> list[float]:
+    if not values:
+        return []
+    scaled = [value / temperature for value in values]
+    max_value = max(scaled)
+    exps = [math.exp(value - max_value) for value in scaled]
+    total = sum(exps)
+    return [value / total for value in exps]
+
+
+def stable_request_seed(request: GenerationRequest) -> int:
+    return sum(ord(char) for char in request.request_id) + (request.policy.policy_version * 1_009)

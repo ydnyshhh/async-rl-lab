@@ -18,15 +18,24 @@ def make_policy(version: int) -> PolicyRef:
     )
 
 
-def make_trajectory(group_id: str, sample_index: int, policy_version: int) -> Trajectory:
+def make_trajectory(
+    group_id: str,
+    sample_index: int,
+    policy_version: int,
+    *,
+    reward: float = 1.0,
+    answer_text: str = "4",
+    raw_text: str | None = None,
+) -> Trajectory:
     policy = make_policy(policy_version)
+    sequence_text = raw_text or f'{{"type":"finish","answer":"{answer_text}"}}'
     action = Action(
         action_id=make_id("action"),
         action_type="finish",
-        raw_text='{"type":"finish","answer":"4"}',
+        raw_text=sequence_text,
         parsed_ts=utc_ts(),
         parser_status="ok",
-        final_text="4",
+        final_text=answer_text,
     )
     observation = Observation(
         observation_id=make_id("obs"),
@@ -45,7 +54,7 @@ def make_trajectory(group_id: str, sample_index: int, policy_version: int) -> Tr
         observation=observation,
         action=action,
         created_ts=utc_ts(),
-        reward=1.0,
+        reward=reward,
         done=True,
     )
     return Trajectory(
@@ -64,15 +73,15 @@ def make_trajectory(group_id: str, sample_index: int, policy_version: int) -> Tr
         prompt_tokens=5,
         completion_tokens=3,
         total_tokens=8,
-        raw_text='{"type":"finish","answer":"4"}',
+        raw_text=sequence_text,
         termination_reason="done",
         transitions=(transition,),
         parsed_action_trace=(action,),
         observations=(observation,),
         tool_calls=(),
         tool_results=(),
-        per_step_rewards=(1.0,),
-        terminal_reward=1.0,
+        per_step_rewards=(reward,),
+        terminal_reward=reward,
         behavior_logprobs=(-0.1,),
     )
 
@@ -108,3 +117,12 @@ class BufferTests(unittest.TestCase):
         result = buffer.insert_group((make_trajectory("group-c", 0, 3), make_trajectory("group-c", 1, 3)))
         self.assertEqual(result.dropped_group_ids, ("group-a",))
         self.assertEqual(tuple(buffer.group_order), ("group-b", "group-c"))
+
+    def test_sample_reports_stale_drops(self) -> None:
+        buffer = InMemoryGroupedRolloutBuffer(capacity_groups=3, required_group_size=2, max_policy_lag=0)
+        buffer.insert_group((make_trajectory("group-a", 0, 0), make_trajectory("group-a", 1, 0)))
+        buffer.insert_group((make_trajectory("group-b", 0, 1), make_trajectory("group-b", 1, 1)))
+        batch = buffer.sample_groups(max_groups=1, learner_policy_version=1)
+        self.assertEqual(batch.group_ids, ("group-b",))
+        self.assertEqual(batch.staleness_stats.dropped_for_staleness, 2)
+        self.assertEqual(batch.metadata["dropped_stale_group_ids"], ["group-a"])

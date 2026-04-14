@@ -18,7 +18,7 @@ async def run_demo() -> None:
     run_id = make_id("run")
     artifact_dir = Path("artifacts") / run_id
     policy_store = LocalPolicyStore(artifact_dir, run_id=run_id)
-    inference_engine = MockInferenceEngine(policy_store.current_policy())
+    inference_engine = MockInferenceEngine(policy_store.current_policy(), policy_store=policy_store)
     rollout_buffer = InMemoryGroupedRolloutBuffer(
         capacity_groups=8,
         required_group_size=4,

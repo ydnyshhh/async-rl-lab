@@ -34,6 +34,8 @@ class InMemoryGroupedRolloutBuffer:
         self.group_order: deque[str] = deque()
         self.groups: dict[str, tuple[Trajectory, ...]] = {}
         self.actor_counter: Counter[str] = Counter()
+        self.total_stale_drops = 0
+        self.total_overflow_drops = 0
 
     def current_size(self) -> int:
         return sum(len(group) for group in self.groups.values())
@@ -80,6 +82,7 @@ class InMemoryGroupedRolloutBuffer:
 
         while len(self.group_order) >= self.capacity_groups:
             dropped_group_ids.append(self.drop_one_group())
+            self.total_overflow_drops += 1
 
         self.group_order.append(group_id)
         self.groups[group_id] = inserted_group
@@ -96,7 +99,10 @@ class InMemoryGroupedRolloutBuffer:
         if not self.group_order:
             return None
         now_ts = utc_ts()
-        self.drop_stale_groups(learner_policy_version=learner_policy_version, now_ts=now_ts)
+        dropped_stale_group_ids = self.drop_stale_groups(
+            learner_policy_version=learner_policy_version,
+            now_ts=now_ts,
+        )
         if not self.group_order:
             return None
 
@@ -127,6 +133,7 @@ class InMemoryGroupedRolloutBuffer:
             created_ts=now_ts,
             min_policy_version=min((trajectory.behavior_policy_version for trajectory in selected), default=None),
             max_policy_version=max((trajectory.behavior_policy_version for trajectory in selected), default=None),
+            dropped_for_staleness=len(dropped_stale_group_ids) * self.required_group_size,
             mean_lag=sum(lag_by_trajectory) / len(lag_by_trajectory) if lag_by_trajectory else 0.0,
             max_lag=max(lag_by_trajectory, default=0),
         )
@@ -141,10 +148,12 @@ class InMemoryGroupedRolloutBuffer:
             sampled_ts=now_ts,
             allow_partial_groups=False,
             staleness_stats=staleness,
+            metadata={"dropped_stale_group_ids": list(dropped_stale_group_ids), "drop_policy": self.drop_policy},
         )
 
-    def drop_stale_groups(self, *, learner_policy_version: int, now_ts: float) -> None:
+    def drop_stale_groups(self, *, learner_policy_version: int, now_ts: float) -> tuple[str, ...]:
         keep: deque[str] = deque()
+        dropped_group_ids: list[str] = []
         for group_id in self.group_order:
             group = self.groups[group_id]
             should_drop = any(
@@ -160,9 +169,12 @@ class InMemoryGroupedRolloutBuffer:
             )
             if should_drop:
                 self.remove_group(group_id)
+                dropped_group_ids.append(group_id)
+                self.total_stale_drops += 1
             else:
                 keep.append(group_id)
         self.group_order = keep
+        return tuple(dropped_group_ids)
 
     def remove_group(self, group_id: str) -> None:
         group = self.groups.pop(group_id, ())
@@ -184,6 +196,17 @@ class InMemoryGroupedRolloutBuffer:
         if trajectory.queue_insert_ts is None:
             return 0.0
         return max(0.0, (now_ts - trajectory.queue_insert_ts) * 1000.0)
+
+    def stats_snapshot(self, *, learner_policy_version: int) -> dict[str, float | int | dict[int, int]]:
+        return {
+            "group_count": self.group_count(),
+            "trajectory_count": self.current_size(),
+            "average_age_ms": self.average_age_ms(),
+            "oldest_item_age_ms": self.oldest_item_age_ms(),
+            "total_stale_drops": self.total_stale_drops,
+            "total_overflow_drops": self.total_overflow_drops,
+            "staleness_histogram": self.staleness_histogram(learner_policy_version),
+        }
 
     def select_most_stale_group(self) -> str:
         if not self.group_order:

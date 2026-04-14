@@ -25,7 +25,7 @@ from async_rl_lab.models import (
     Transition,
 )
 from async_rl_lab.objectives import DAPOObjective, GRPOObjective, StalenessWeightedGRPO
-from async_rl_lab.policy_store import LocalPolicyStore
+from async_rl_lab.policy_store import LocalPolicyStore, PolicyUpdateStats, SequencePolicyState, SequenceScore
 
 __all__ = [
     "Action",
@@ -45,8 +45,11 @@ __all__ = [
     "LocalPolicyStore",
     "MockInferenceEngine",
     "Observation",
+    "PolicyUpdateStats",
     "PolicyRef",
     "RewardResult",
+    "SequencePolicyState",
+    "SequenceScore",
     "StalenessStats",
     "StalenessWeightedGRPO",
     "ToolCall",

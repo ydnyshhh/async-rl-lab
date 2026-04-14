@@ -29,6 +29,7 @@ class ActorConfig:
 class LearnerConfig:
     max_groups_per_batch: int = 2
     publish_every_steps: int = 1
+    learning_rate: float = 0.05
 
 
 async def actor_main_loop(
@@ -51,15 +52,27 @@ async def actor_main_loop(
 
     while not stop_event.is_set():
         now_ts = utc_ts()
+        inference_metrics = inference_engine.metrics_snapshot()
+        generation_latencies = inference_metrics.histograms.get("inference.latency_ms", ())
+        queue_waits = inference_metrics.histograms.get("inference.queue_wait_ms", ())
+        served_policy_version = inference_engine.current_policy().policy_version
+        learner_policy_version = policy_store.current_policy().policy_version
         if now_ts - last_heartbeat_ts >= config.heartbeat_interval_s:
             heartbeat = ActorHeartbeat(
                 actor_id=actor_id,
-                current_policy_version=policy_store.current_policy().policy_version,
+                current_policy_version=served_policy_version,
                 queue_depth=rollout_buffer.group_count(),
                 running_episodes=0,
                 completed_episodes=completed_episodes,
                 failed_episodes=failed_episodes,
                 last_seen_ts=now_ts,
+                mean_generation_latency_ms=mean_or_none(generation_latencies),
+                mean_verifier_latency_ms=None,
+                metadata={
+                    "learner_policy_version": learner_policy_version,
+                    "policy_version_gap": learner_policy_version - served_policy_version,
+                    "mean_queue_wait_ms": mean_or_none(queue_waits),
+                },
             )
             event_logger.log(
                 "ActorHeartbeat",
@@ -296,19 +309,58 @@ async def learner_main_loop(
             "LearnerBatchBuilt",
             learner_step=learner_step,
             policy_version=policy_store.current_policy().policy_version,
-            payload={"batch_id": batch.batch_id, "group_ids": list(batch.group_ids)},
+            payload={
+                "batch_id": batch.batch_id,
+                "group_ids": list(batch.group_ids),
+                "dropped_stale_groups": batch.staleness_stats.dropped_for_staleness if batch.staleness_stats else 0,
+                "drop_policy": rollout_buffer.drop_policy,
+            },
         )
         prepared = objective.prepare_batch(batch)
-        model_logprob_summaries = [sum(trajectory.behavior_logprobs or (-0.1,)) for trajectory in batch.trajectories]
+        scoring_policy = policy_store.current_policy()
+        current_scores = policy_store.score_many(
+            [trajectory.raw_text for trajectory in batch.trajectories],
+            policy_version=scoring_policy.policy_version,
+        )
+        model_logprob_summaries = [score.mean_logprob for score in current_scores]
         loss = objective.compute_loss(prepared, model_logprob_summaries=model_logprob_summaries)
-        metrics = objective.compute_metrics(prepared)
+        update_stats = policy_store.train_on_sequences(
+            policy_version=scoring_policy.policy_version,
+            sequences=[trajectory.raw_text for trajectory in batch.trajectories],
+            advantages=prepared.advantages,
+            sequence_weights=prepared.sequence_weights,
+            learning_rate=config.learning_rate,
+        )
+        metrics = {
+            **objective.compute_metrics(prepared),
+            "mean_current_logprob": update_stats.mean_current_logprob,
+            "mean_behavior_logprob": mean_behavior_logprob(batch.trajectories),
+            "mean_rollout_age_ms": mean_or_zero(batch.staleness_stats.age_ms_by_trajectory if batch.staleness_stats else ()),
+            "oldest_rollout_age_ms": max(batch.staleness_stats.age_ms_by_trajectory, default=0.0)
+            if batch.staleness_stats
+            else 0.0,
+            "mean_policy_lag": batch.staleness_stats.mean_lag if batch.staleness_stats else 0.0,
+            "max_policy_lag": float(batch.staleness_stats.max_lag) if batch.staleness_stats else 0.0,
+            "dropped_stale_trajectories": float(batch.staleness_stats.dropped_for_staleness)
+            if batch.staleness_stats
+            else 0.0,
+            "mean_queue_wait_ms": mean_or_zero(
+                tuple(trajectory.queue_wait_ms or 0.0 for trajectory in batch.trajectories)
+            ),
+            "mean_staleness_weight": mean_or_zero(prepared.sequence_weights),
+        }
         learner_step += 1
         published_policy = None
         if learner_step % config.publish_every_steps == 0:
             published_policy = await policy_store.publish_policy(
                 checkpoint_step=learner_step,
                 policy_tag=f"learner-step-{learner_step}",
-                metadata={"loss": loss},
+                metadata={
+                    "loss": loss,
+                    "gradient_norm": update_stats.gradient_norm,
+                    "mean_current_logprob": update_stats.mean_current_logprob,
+                },
+                state=update_stats.updated_state,
             )
             await inference_engine.refresh_policy(published_policy)
             event_logger.log(
@@ -330,6 +382,7 @@ async def learner_main_loop(
             mean_reward=metrics.get("mean_reward", 0.0),
             mean_advantage=metrics.get("mean_advantage"),
             loss=loss,
+            gradient_norm=update_stats.gradient_norm,
             clipped_fraction=prepared.metrics.get("clipped_fraction"),
             stale_fraction=(
                 1.0
@@ -410,3 +463,23 @@ async def policy_refresh_logic(
             payload={"policy_tag": latest.policy_tag},
         )
     return latest
+
+
+def mean_or_none(values) -> float | None:
+    values_tuple = tuple(values)
+    if not values_tuple:
+        return None
+    return sum(values_tuple) / len(values_tuple)
+
+
+def mean_or_zero(values) -> float:
+    result = mean_or_none(values)
+    return result if result is not None else 0.0
+
+
+def mean_behavior_logprob(trajectories: tuple[Trajectory, ...]) -> float:
+    summaries = []
+    for trajectory in trajectories:
+        if trajectory.behavior_logprobs:
+            summaries.append(sum(trajectory.behavior_logprobs) / len(trajectory.behavior_logprobs))
+    return sum(summaries) / len(summaries) if summaries else 0.0
