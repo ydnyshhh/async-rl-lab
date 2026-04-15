@@ -190,7 +190,7 @@ async def actor_main_loop(
         inference_metrics = inference_engine.metrics_snapshot()
         generation_latencies = inference_metrics.histograms.get("inference.latency_ms", ())
         queue_waits = inference_metrics.histograms.get("inference.queue_wait_ms", ())
-        engine_loaded_policy_version = inference_engine.current_policy().policy_version
+        engine_loaded_policy_version = inference_engine.current_policy(actor_id=actor_id).policy_version
         actor_adopted_policy_version = (
             policy_adoption_controller.current_adopted_policy(actor_id).policy_version
             if policy_adoption_controller is not None
@@ -519,9 +519,11 @@ async def learner_main_loop(
             reference_sequence_logprobs=tuple(reference_sequence_logprobs),
         )
         objective_result = objective.compute_loss(prepared, rescored)
-        update_stats = policy_store.train_on_sequences(
+        update_stats = policy_store.train_on_turns(
             policy_version=scoring_policy.policy_version,
-            sequences=[trajectory.raw_text for trajectory in batch.trajectories],
+            turn_texts=[extract_turn_texts(trajectory) for trajectory in batch.trajectories],
+            turn_training_masks=prepared.training_turn_masks,
+            turn_action_types=prepared.turn_action_types,
             advantages=objective_result.update_advantages,
             sequence_weights=tuple(1.0 for _ in batch.trajectories),
             learning_rate=config.learning_rate,
@@ -544,6 +546,7 @@ async def learner_main_loop(
             ),
             "mean_staleness_weight": mean_or_zero(prepared.sequence_weights),
             "reference_policy_version": float(reference_policy_version),
+            "trained_active_tokens": float(update_stats.token_count),
         }
         learner_step += 1
         published_policy = None
@@ -744,7 +747,7 @@ async def policy_adoption_loop(
             adoption_delay_ms = controller.actor_delay_ms(pending.actor_id)
             if adoption_delay_ms > 0.0:
                 await asyncio.sleep(adoption_delay_ms / 1000.0)
-            await inference_engine.refresh_policy(pending.policy)
+            await inference_engine.refresh_policy(pending.policy, actor_id=pending.actor_id)
             await controller.mark_adopted(pending.actor_id, pending.policy)
             event_logger.log(
                 "PolicyActorAdopted",
@@ -787,8 +790,8 @@ async def policy_refresh_logic(
             )
         return adopted
     latest = policy_store.current_policy()
-    if inference_engine.current_policy().policy_version != latest.policy_version:
-        await inference_engine.refresh_policy(latest)
+    if inference_engine.current_policy(actor_id=actor_id).policy_version != latest.policy_version:
+        await inference_engine.refresh_policy(latest, actor_id=actor_id)
         event_logger.log(
             "PolicyRefreshed",
             actor_id=actor_id,

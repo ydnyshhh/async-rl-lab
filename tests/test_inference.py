@@ -124,9 +124,34 @@ class InferenceEngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result_v1.metadata["served_policy_version"], policy_v1.policy_version)
             self.assertEqual(result_v2.metadata["served_policy_version"], policy_v2.policy_version)
 
+    async def test_mock_engine_tracks_actor_local_policies(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            policy_store = LocalPolicyStore(root, run_id="run-test")
+            policy_v0 = policy_store.current_policy()
+            updated = policy_store.train_on_sequences(
+                policy_version=policy_v0.policy_version,
+                sequences=['{"type":"finish","answer":"4"}'],
+                advantages=(1.0,),
+                sequence_weights=(1.0,),
+                learning_rate=0.1,
+            )
+            policy_v1 = await policy_store.publish_policy(
+                checkpoint_step=1,
+                policy_tag="v1",
+                state=updated.updated_state,
+            )
+            engine = MockInferenceEngine(policy_v0, policy_store=policy_store, batch_window_ms=1.0, artificial_latency_ms=1.0)
+
+            await engine.refresh_policy(policy_v1, actor_id="actor-0")
+
+            self.assertEqual(engine.current_policy(actor_id="actor-0").policy_version, 1)
+            self.assertEqual(engine.current_policy(actor_id="actor-1").policy_version, 0)
+
     async def test_hf_engine_queue_and_metrics_without_external_model(self) -> None:
         class FakeHFInferenceEngine(HFInferenceEngine):
-            async def ensure_policy_loaded(self, policy):
+            async def ensure_policy_loaded(self, policy, *, actor_id=None):
+                del actor_id
                 self.loaded_policy = policy
                 return 0.0
 

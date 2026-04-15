@@ -186,46 +186,97 @@ class LocalPolicyStore:
         if not (len(sequences) == len(advantages) == len(sequence_weights)):
             raise ValueError("sequences, advantages, and sequence_weights must align")
 
+        return self.train_on_turns(
+            policy_version=policy_version,
+            turn_texts=tuple((sequence,) for sequence in sequences),
+            turn_training_masks=tuple(
+                (tuple(1 for _ in tokenize_text(sequence)),) for sequence in sequences
+            ),
+            turn_action_types=tuple((infer_action_type(sequence),) for sequence in sequences),
+            advantages=advantages,
+            sequence_weights=sequence_weights,
+            learning_rate=learning_rate,
+        )
+
+    def train_on_turns(
+        self,
+        *,
+        policy_version: int,
+        turn_texts: Sequence[Sequence[str]],
+        turn_training_masks: Sequence[Sequence[Sequence[int]]],
+        turn_action_types: Sequence[Sequence[str]],
+        advantages: Sequence[float],
+        sequence_weights: Sequence[float],
+        learning_rate: float,
+    ) -> PolicyUpdateStats:
+        if not (
+            len(turn_texts)
+            == len(turn_training_masks)
+            == len(turn_action_types)
+            == len(advantages)
+            == len(sequence_weights)
+        ):
+            raise ValueError("turn_texts, turn_training_masks, turn_action_types, advantages, and sequence_weights must align")
+
         base_state = self.load_policy_state(policy_version)
-        base_scores = self.score_many(sequences, state=base_state)
+        flat_turn_texts = [turn_text for turns in turn_texts for turn_text in turns]
+        base_scores = self.score_many(flat_turn_texts, state=base_state)
         token_logits = dict(base_state.token_logits)
         action_bias = dict(base_state.action_bias)
         total_delta_sq = 0.0
         total_token_count = 0
 
-        for sequence, advantage, weight in zip(sequences, advantages, sequence_weights):
+        for trajectory_turns, trajectory_masks, trajectory_action_types, advantage, weight in zip(
+            turn_texts,
+            turn_training_masks,
+            turn_action_types,
+            advantages,
+            sequence_weights,
+        ):
             scaled_advantage = advantage * weight
-            tokens = tokenize_text(sequence)
-            action_type = infer_action_type(sequence)
-            if not tokens or abs(scaled_advantage) < 1e-12:
+            if abs(scaled_advantage) < 1e-12:
                 continue
 
-            total_token_count += len(tokens)
-            for token in tokens:
-                token_logits.setdefault(token, base_state.unk_logit)
+            turn_count = min(len(trajectory_turns), len(trajectory_masks), len(trajectory_action_types))
+            for turn_index in range(turn_count):
+                turn_text = trajectory_turns[turn_index]
+                action_type = trajectory_action_types[turn_index]
+                tokens = tokenize_text(turn_text)
+                normalized_mask = normalize_mask_row(trajectory_masks[turn_index], len(tokens))
+                active_tokens = [token for token, flag in zip(tokens, normalized_mask) if flag == 1]
+                active_fraction = sum(normalized_mask) / max(1, len(normalized_mask))
+                should_update_action = action_type != "invalid" and active_fraction > 0.0
+                if not active_tokens and not should_update_action:
+                    continue
 
-            logit_values = tuple(token_logits.values())
-            normalizer = logsumexp(logit_values)
-            probabilities = {
-                token: math.exp(logit - normalizer)
-                for token, logit in token_logits.items()
-            }
-            counts = Counter(tokens)
-            step_size = learning_rate * scaled_advantage / max(1, len(tokens))
+                if active_tokens:
+                    total_token_count += len(active_tokens)
+                    for token in active_tokens:
+                        token_logits.setdefault(token, base_state.unk_logit)
 
-            for token, probability in probabilities.items():
-                gradient = counts.get(token, 0) - len(tokens) * probability
-                delta = step_size * gradient
-                token_logits[token] += delta
-                total_delta_sq += delta * delta
+                    logit_values = tuple(token_logits.values())
+                    normalizer = logsumexp(logit_values)
+                    probabilities = {
+                        token: math.exp(logit - normalizer)
+                        for token, logit in token_logits.items()
+                    }
+                    counts = Counter(active_tokens)
+                    step_size = learning_rate * scaled_advantage / max(1, len(active_tokens))
 
-            action_probabilities = action_prob_softmax(action_bias)
-            for name, probability in action_probabilities.items():
-                gradient = 1.0 if name == action_type else 0.0
-                gradient -= probability
-                delta = learning_rate * scaled_advantage * gradient
-                action_bias[name] += delta
-                total_delta_sq += delta * delta
+                    for token, probability in probabilities.items():
+                        gradient = counts.get(token, 0) - len(active_tokens) * probability
+                        delta = step_size * gradient
+                        token_logits[token] += delta
+                        total_delta_sq += delta * delta
+
+                if should_update_action:
+                    action_probabilities = action_prob_softmax(action_bias)
+                    for name, probability in action_probabilities.items():
+                        gradient = 1.0 if name == action_type else 0.0
+                        gradient -= probability
+                        delta = learning_rate * scaled_advantage * active_fraction * gradient
+                        action_bias[name] += delta
+                        total_delta_sq += delta * delta
 
         updated_state = SequencePolicyState(
             token_logits=token_logits,
@@ -233,7 +284,11 @@ class LocalPolicyStore:
             unk_logit=base_state.unk_logit,
             update_count=base_state.update_count + 1,
             tokens_seen=base_state.tokens_seen + total_token_count,
-            metadata={**base_state.metadata, "last_learning_rate": learning_rate},
+            metadata={
+                **base_state.metadata,
+                "last_learning_rate": learning_rate,
+                "last_update_mode": "turn_masked",
+            },
         )
         mean_current_logprob = (
             sum(score.mean_logprob for score in base_scores) / len(base_scores) if base_scores else 0.0
@@ -338,3 +393,16 @@ def logsumexp(values: Iterable[float]) -> float:
         return 0.0
     max_value = max(value_list)
     return max_value + math.log(sum(math.exp(value - max_value) for value in value_list))
+
+
+def normalize_mask_row(mask_row: Sequence[int], target_length: int) -> tuple[int, ...]:
+    if target_length <= 0:
+        return ()
+    mask_values = tuple(int(value) for value in mask_row)
+    if not mask_values:
+        return tuple(1 for _ in range(target_length))
+    if len(mask_values) == target_length:
+        return mask_values
+    if len(mask_values) > target_length:
+        return mask_values[:target_length]
+    return mask_values + tuple(0 for _ in range(target_length - len(mask_values)))

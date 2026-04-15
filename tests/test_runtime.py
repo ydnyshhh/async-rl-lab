@@ -142,6 +142,7 @@ class RuntimeLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(results), 1)
             self.assertEqual(policy_store.current_policy().policy_version, 1)
             self.assertEqual(inference_engine.current_policy().policy_version, 0)
+            self.assertEqual(inference_engine.current_policy(actor_id="actor-0").policy_version, 0)
             self.assertEqual(controller.current_published_policy().policy_version, 1)
             self.assertEqual(controller.current_adopted_policy("actor-0").policy_version, 0)
 
@@ -155,6 +156,7 @@ class RuntimeLoopTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(inference_engine.current_policy().policy_version, 1)
             self.assertEqual(controller.current_adopted_policy("actor-0").policy_version, 1)
+            self.assertEqual(inference_engine.current_policy(actor_id="actor-0").policy_version, 1)
 
     async def test_partial_rollout_keeps_one_actor_stale(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

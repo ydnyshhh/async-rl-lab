@@ -6,6 +6,7 @@ import unittest
 from async_rl_lab.models import Action
 from async_rl_lab.buffer import InMemoryGroupedRolloutBuffer
 from async_rl_lab.objectives import DAPOObjective, GRPOObjective, RescoredBatch, StalenessWeightedGRPO
+from async_rl_lab.policy_store import tokenize_text
 from tests.test_buffer import make_trajectory
 
 
@@ -83,7 +84,10 @@ class ObjectiveTests(unittest.TestCase):
             base,
             parsed_action_trace=(tool_action, finish_action),
             transitions=(tool_transition, finish_transition),
-            behavior_token_logprobs=((0.0, -0.1), (-0.2, -0.3)),
+            behavior_token_logprobs=(
+                tuple(0.0 for _ in tokenize_text(tool_action.raw_text)),
+                tuple(0.0 for _ in tokenize_text(finish_action.raw_text)),
+            ),
         )
         buffer = InMemoryGroupedRolloutBuffer(capacity_groups=1, required_group_size=1)
         buffer.insert_group((trajectory,))
@@ -92,5 +96,7 @@ class ObjectiveTests(unittest.TestCase):
         prepared = GRPOObjective().prepare_batch(batch)
 
         self.assertEqual(prepared.turn_action_types[0], ("tool_call", "finish"))
-        self.assertEqual(prepared.tool_turn_masks[0][0], (1, 1))
-        self.assertEqual(prepared.answer_turn_masks[0][1], (1, 1))
+        self.assertGreater(sum(prepared.tool_turn_masks[0][0]), 0)
+        self.assertLess(sum(prepared.tool_turn_masks[0][0]), len(prepared.tool_turn_masks[0][0]))
+        self.assertGreater(sum(prepared.answer_turn_masks[0][1]), 0)
+        self.assertLess(sum(prepared.answer_turn_masks[0][1]), len(prepared.answer_turn_masks[0][1]))

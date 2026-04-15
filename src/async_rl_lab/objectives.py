@@ -3,16 +3,19 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+import json
 import math
+import re
 from typing import Protocol
 
-from async_rl_lab.models import GroupedTrajectoryBatch, Trajectory
+from async_rl_lab.models import Action, GroupedTrajectoryBatch, Trajectory
 
 ActionTypeLabel = str
 TurnLogprobRows = tuple[tuple[float, ...], ...]
 TrajectoryTurnRows = tuple[TurnLogprobRows, ...]
 TurnMaskRows = tuple[tuple[tuple[int, ...], ...], ...]
 TurnLabels = tuple[tuple[ActionTypeLabel, ...], ...]
+SemanticTokenPattern = re.compile(r"[A-Za-z0-9_]+|[^\sA-Za-z0-9_]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,12 +419,25 @@ def build_turn_token_masks(
         action_type = action_types[index] if index < len(action_types) else "finish"
         token_count = max(1, len(row))
         is_truncated_tail = trajectory.is_truncated and index == last_turn_index
-        training_value = 0 if action_type == "invalid" or is_truncated_tail else 1
-        answer_value = 1 if action_type in {"finish", "respond"} and training_value == 1 else 0
-        tool_value = 1 if action_type == "tool_call" and training_value == 1 else 0
-        training_masks.append(tuple(training_value for _ in range(token_count)))
-        answer_masks.append(tuple(answer_value for _ in range(token_count)))
-        tool_masks.append(tuple(tool_value for _ in range(token_count)))
+        action = trajectory.parsed_action_trace[index] if index < len(trajectory.parsed_action_trace) else None
+        training_row, answer_row, tool_row = build_action_semantic_masks(
+            action=action,
+            action_type=action_type,
+            target_token_count=token_count,
+        )
+        if action_type == "invalid" or is_truncated_tail:
+            zero_row = tuple(0 for _ in range(token_count))
+            training_masks.append(zero_row)
+            answer_masks.append(zero_row)
+            tool_masks.append(zero_row)
+            continue
+        if sum(training_row) == 0:
+            training_row = tuple(1 for _ in range(token_count))
+            answer_row = tuple(1 if action_type in {"finish", "respond"} else 0 for _ in range(token_count))
+            tool_row = tuple(1 if action_type == "tool_call" else 0 for _ in range(token_count))
+        training_masks.append(training_row)
+        answer_masks.append(answer_row)
+        tool_masks.append(tool_row)
     return tuple(training_masks), tuple(answer_masks), tuple(tool_masks)
 
 
@@ -491,6 +507,133 @@ def flatten_turn_rows(turn_rows: TurnLogprobRows) -> tuple[float, ...]:
 
 def flatten_int_turn_rows(turn_rows: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
     return tuple(value for row in turn_rows for value in row)
+
+
+def build_action_semantic_masks(
+    *,
+    action: Action | None,
+    action_type: ActionTypeLabel,
+    target_token_count: int,
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    if action is None:
+        zero_row = tuple(0 for _ in range(target_token_count))
+        return zero_row, zero_row, zero_row
+
+    raw_tokens = tokenize_semantic_text(action.raw_text)
+    if not raw_tokens:
+        zero_row = tuple(0 for _ in range(target_token_count))
+        return zero_row, zero_row, zero_row
+
+    answer_source = tuple(0 for _ in raw_tokens)
+    tool_source = tuple(0 for _ in raw_tokens)
+    if action_type in {"finish", "respond"}:
+        answer_source = mark_token_subsequence(raw_tokens, extract_answer_tokens(action))
+    elif action_type == "tool_call":
+        tool_source = mark_token_subsequence(raw_tokens, extract_tool_tokens(action))
+
+    training_source = tuple(1 if answer == 1 or tool == 1 else 0 for answer, tool in zip(answer_source, tool_source))
+    return (
+        project_mask_row(training_source, target_token_count),
+        project_mask_row(answer_source, target_token_count),
+        project_mask_row(tool_source, target_token_count),
+    )
+
+
+def tokenize_semantic_text(text: str) -> tuple[str, ...]:
+    return tuple(SemanticTokenPattern.findall(text))
+
+
+def extract_answer_tokens(action: Action) -> tuple[str, ...]:
+    if action.final_text:
+        return tokenize_semantic_text(action.final_text)
+    payload = parse_action_payload(action.raw_text)
+    answer_value = payload.get("answer") or payload.get("text")
+    if isinstance(answer_value, str):
+        return tokenize_semantic_text(answer_value)
+    return ()
+
+
+def extract_tool_tokens(action: Action) -> tuple[str, ...]:
+    if action.tool_call is not None:
+        direct_tool_tokens = list(tokenize_semantic_text(action.tool_call.tool_name))
+        for value in action.tool_call.arguments.values():
+            direct_tool_tokens.extend(flatten_json_value_tokens(value))
+        return tuple(direct_tool_tokens)
+
+    payload = parse_action_payload(action.raw_text)
+    payload_tool_tokens: list[str] = []
+    tool_name = payload.get("tool_name")
+    if isinstance(tool_name, str):
+        payload_tool_tokens.extend(tokenize_semantic_text(tool_name))
+    arguments = payload.get("arguments")
+    if isinstance(arguments, dict):
+        for value in arguments.values():
+            payload_tool_tokens.extend(flatten_json_value_tokens(value))
+    return tuple(payload_tool_tokens)
+
+
+def parse_action_payload(raw_text: str) -> dict[str, object]:
+    try:
+        payload = json.loads(raw_text.strip())
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def flatten_json_value_tokens(value: object) -> list[str]:
+    if isinstance(value, str):
+        return list(tokenize_semantic_text(value))
+    if isinstance(value, bool):
+        return [str(value).lower()]
+    if isinstance(value, int | float):
+        return list(tokenize_semantic_text(str(value)))
+    if isinstance(value, list):
+        list_tokens: list[str] = []
+        for item in value:
+            list_tokens.extend(flatten_json_value_tokens(item))
+        return list_tokens
+    if isinstance(value, dict):
+        dict_tokens: list[str] = []
+        for item in value.values():
+            dict_tokens.extend(flatten_json_value_tokens(item))
+        return dict_tokens
+    return []
+
+
+def mark_token_subsequence(source_tokens: tuple[str, ...], target_tokens: tuple[str, ...]) -> tuple[int, ...]:
+    if not source_tokens or not target_tokens:
+        return tuple(0 for _ in source_tokens)
+    marked = [0 for _ in source_tokens]
+    cursor = 0
+    for target_token in target_tokens:
+        found_index = find_token(source_tokens, target_token, start=cursor)
+        if found_index is None:
+            continue
+        marked[found_index] = 1
+        cursor = found_index + 1
+    return tuple(marked)
+
+
+def find_token(source_tokens: tuple[str, ...], target_token: str, *, start: int) -> int | None:
+    for index in range(start, len(source_tokens)):
+        if source_tokens[index] == target_token:
+            return index
+    return None
+
+
+def project_mask_row(mask_row: tuple[int, ...], target_length: int) -> tuple[int, ...]:
+    if target_length <= 0:
+        return ()
+    if not mask_row:
+        return tuple(0 for _ in range(target_length))
+    if len(mask_row) == target_length:
+        return mask_row
+    projected: list[int] = []
+    source_length = len(mask_row)
+    for target_index in range(target_length):
+        source_index = min(source_length - 1, int((target_index * source_length) / target_length))
+        projected.append(mask_row[source_index])
+    return tuple(projected)
 
 
 def sampled_forward_kl_penalty(*, current_logprob: float, reference_logprob: float) -> float:

@@ -27,10 +27,10 @@ class InferenceEngine(Protocol):
     async def submit_many(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
         ...
 
-    async def refresh_policy(self, policy: PolicyRef) -> None:
+    async def refresh_policy(self, policy: PolicyRef, *, actor_id: str | None = None) -> None:
         ...
 
-    def current_policy(self) -> PolicyRef:
+    def current_policy(self, *, actor_id: str | None = None) -> PolicyRef:
         ...
 
     def metrics_snapshot(self) -> MetricsSnapshot:
@@ -135,9 +135,12 @@ class MockInferenceEngine:
         max_batch_size: int = 16,
         artificial_latency_ms: float = 25.0,
     ) -> None:
+        self.initial_policy = initial_policy
         self.loaded_policy = initial_policy
         self.policy_store = policy_store
         self.loaded_state: SequencePolicyState | None = None
+        self.actor_loaded_policies: dict[str, PolicyRef] = {}
+        self.actor_loaded_states: dict[str, SequencePolicyState] = {}
         self.batch_window_ms = batch_window_ms
         self.max_batch_size = max_batch_size
         self.artificial_latency_ms = artificial_latency_ms
@@ -165,10 +168,12 @@ class MockInferenceEngine:
         results = await asyncio.gather(*(self.submit(request) for request in requests))
         return list(results)
 
-    async def refresh_policy(self, policy: PolicyRef) -> None:
-        self.last_refresh_latency_ms = await self.ensure_policy_loaded(policy)
+    async def refresh_policy(self, policy: PolicyRef, *, actor_id: str | None = None) -> None:
+        self.last_refresh_latency_ms = await self.ensure_policy_loaded(policy, actor_id=actor_id)
 
-    def current_policy(self) -> PolicyRef:
+    def current_policy(self, *, actor_id: str | None = None) -> PolicyRef:
+        if actor_id is not None:
+            return self.actor_loaded_policies.get(actor_id, self.initial_policy)
         return self.loaded_policy
 
     def metrics_snapshot(self) -> MetricsSnapshot:
@@ -181,6 +186,8 @@ class MockInferenceEngine:
             self.worker_task = None
         self.pending_queue = asyncio.Queue()
         self.stop_event = asyncio.Event()
+        self.actor_loaded_policies = {}
+        self.actor_loaded_states = {}
 
     async def batch_worker(self) -> None:
         while not self.stop_event.is_set():
@@ -194,13 +201,14 @@ class MockInferenceEngine:
             while len(batch) < self.max_batch_size and not self.pending_queue.empty():
                 batch.append(self.pending_queue.get_nowait())
 
-            for policy_batch in self.partition_batch_by_policy(batch):
+            for policy_batch in self.partition_batch_by_actor_policy(batch):
                 await self.process_batch(policy_batch)
 
     async def process_batch(self, batch: list[PendingGeneration]) -> None:
         dispatch_ts = utc_ts()
+        actor_id = batch[0].request.actor_id
         policy_ref = batch[0].request.policy
-        policy_load_latency_ms = await self.ensure_policy_loaded(policy_ref)
+        policy_load_latency_ms = await self.ensure_policy_loaded(policy_ref, actor_id=actor_id)
         started_ts = utc_ts()
         self.metrics.increment("inference.batches")
         self.metrics.observe("inference.batch_size", float(len(batch)))
@@ -208,7 +216,7 @@ class MockInferenceEngine:
         for pending in batch:
             generated_text = self.generate_text(pending.request)
             action = parse_action_text(generated_text)
-            score = self.score_generated_text(generated_text)
+            score = self.score_generated_text(generated_text, pending.request)
             ended_ts = utc_ts()
             prompt_tokens = max(1, len(pending.request.observation_text.split()))
             completion_tokens = max(1, len(score.token_logprobs) or len(generated_text.split()))
@@ -247,10 +255,11 @@ class MockInferenceEngine:
                 action=action,
                 token_logprobs=score.token_logprobs,
                 metadata={
-                    "engine_policy_version": self.loaded_policy.policy_version,
+                    "engine_policy_version": self.current_policy(actor_id=pending.request.actor_id).policy_version,
                     "served_policy_version": policy_ref.policy_version,
                     "policy_load_latency_ms": policy_load_latency_ms,
                     "batch_size": len(batch),
+                    "fleet_policy_version": self.loaded_policy.policy_version,
                 },
             )
             if not pending.future.done():
@@ -263,10 +272,11 @@ class MockInferenceEngine:
         candidates = self.build_candidates(request)
         if len(candidates) == 1:
             return candidates[0]
-        if self.policy_store is None or self.loaded_state is None:
+        active_state = self.state_for_request(request)
+        if self.policy_store is None or active_state is None:
             return candidates[0]
 
-        scores = [self.policy_store.score_text(candidate, state=self.loaded_state) for candidate in candidates]
+        scores = [self.policy_store.score_text(candidate, state=active_state) for candidate in candidates]
         score_values = [score.mean_logprob for score in scores]
         temperature = max(request.temperature, 1e-4)
         if temperature <= 1e-3:
@@ -305,35 +315,52 @@ class MockInferenceEngine:
                 deduped.append(candidate)
         return deduped
 
-    def score_generated_text(self, generated_text: str):
-        if self.policy_store is None or self.loaded_state is None:
+    def score_generated_text(self, generated_text: str, request: GenerationRequest):
+        active_state = self.state_for_request(request)
+        if self.policy_store is None or active_state is None:
             token_count = max(1, len(generated_text.split()))
             return type("FallbackScore", (), {"token_logprobs": tuple(-1.0 for _ in range(token_count))})()
-        return self.policy_store.score_text(generated_text, state=self.loaded_state)
+        return self.policy_store.score_text(generated_text, state=active_state)
 
-    async def ensure_policy_loaded(self, policy: PolicyRef) -> float:
+    async def ensure_policy_loaded(self, policy: PolicyRef, *, actor_id: str | None = None) -> float:
+        if actor_id is not None:
+            actor_policy = self.actor_loaded_policies.get(actor_id)
+            actor_state = self.actor_loaded_states.get(actor_id)
+            if actor_policy is not None and actor_policy.policy_version == policy.policy_version and actor_state is not None:
+                return 0.0
         if self.loaded_policy.policy_version == policy.policy_version and self.loaded_state is not None:
+            if actor_id is not None:
+                self.actor_loaded_policies[actor_id] = policy
+                self.actor_loaded_states[actor_id] = self.loaded_state
             return 0.0
         started_ts = utc_ts()
         await asyncio.sleep(self.artificial_latency_ms / 1000.0)
         if self.policy_store is not None:
             self.loaded_state = self.policy_store.load_policy_state(policy.policy_version)
         self.loaded_policy = policy
+        if actor_id is not None and self.loaded_state is not None:
+            self.actor_loaded_policies[actor_id] = policy
+            self.actor_loaded_states[actor_id] = self.loaded_state
         ended_ts = utc_ts()
         latency_ms = (ended_ts - started_ts) * 1000.0
         self.metrics.increment("inference.policy_refresh_count")
         self.metrics.observe("inference.policy_refresh_latency_ms", latency_ms)
         return latency_ms
 
-    def partition_batch_by_policy(self, batch: list[PendingGeneration]) -> list[list[PendingGeneration]]:
-        buckets: dict[int, list[PendingGeneration]] = defaultdict(list)
-        order: list[int] = []
+    def partition_batch_by_actor_policy(self, batch: list[PendingGeneration]) -> list[list[PendingGeneration]]:
+        buckets: dict[tuple[str, int], list[PendingGeneration]] = defaultdict(list)
+        order: list[tuple[str, int]] = []
         for pending in batch:
-            policy_version = pending.request.policy.policy_version
-            if policy_version not in buckets:
-                order.append(policy_version)
-            buckets[policy_version].append(pending)
-        return [buckets[policy_version] for policy_version in order]
+            bucket_key = (pending.request.actor_id, pending.request.policy.policy_version)
+            if bucket_key not in buckets:
+                order.append(bucket_key)
+            buckets[bucket_key].append(pending)
+        return [buckets[bucket_key] for bucket_key in order]
+
+    def state_for_request(self, request: GenerationRequest) -> SequencePolicyState | None:
+        if request.actor_id in self.actor_loaded_states:
+            return self.actor_loaded_states[request.actor_id]
+        return self.loaded_state
 
 
 class HFInferenceEngine:
@@ -347,6 +374,7 @@ class HFInferenceEngine:
         max_batch_size: int = 8,
         generation_defaults: dict[str, object] | None = None,
     ) -> None:
+        self.initial_policy = initial_policy
         self.loaded_policy = initial_policy
         self.model_name_or_path = model_name_or_path
         self.device = device
@@ -361,6 +389,8 @@ class HFInferenceEngine:
         self.loaded_model: Any | None = None
         self.loaded_tokenizer: Any | None = None
         self.loaded_model_source: str | None = None
+        self.actor_loaded_policies: dict[str, PolicyRef] = {}
+        self.actor_loaded_sources: dict[str, str] = {}
         self.last_refresh_latency_ms = 0.0
 
     async def start(self) -> None:
@@ -381,10 +411,12 @@ class HFInferenceEngine:
         results = await asyncio.gather(*(self.submit(request) for request in requests))
         return list(results)
 
-    async def refresh_policy(self, policy: PolicyRef) -> None:
-        self.last_refresh_latency_ms = await self.ensure_policy_loaded(policy)
+    async def refresh_policy(self, policy: PolicyRef, *, actor_id: str | None = None) -> None:
+        self.last_refresh_latency_ms = await self.ensure_policy_loaded(policy, actor_id=actor_id)
 
-    def current_policy(self) -> PolicyRef:
+    def current_policy(self, *, actor_id: str | None = None) -> PolicyRef:
+        if actor_id is not None:
+            return self.actor_loaded_policies.get(actor_id, self.initial_policy)
         return self.loaded_policy
 
     def metrics_snapshot(self) -> MetricsSnapshot:
@@ -402,6 +434,8 @@ class HFInferenceEngine:
         self.stop_event = asyncio.Event()
         self.loaded_model = None
         self.loaded_tokenizer = None
+        self.actor_loaded_policies = {}
+        self.actor_loaded_sources = {}
 
     async def batch_worker(self) -> None:
         while not self.stop_event.is_set():
@@ -420,8 +454,9 @@ class HFInferenceEngine:
 
     async def process_batch(self, batch: list[PendingGeneration]) -> None:
         dispatch_ts = utc_ts()
+        actor_id = batch[0].request.actor_id
         policy_ref = batch[0].request.policy
-        policy_load_latency_ms = await self.ensure_policy_loaded(policy_ref)
+        policy_load_latency_ms = await self.ensure_policy_loaded(policy_ref, actor_id=actor_id)
         started_ts = utc_ts()
         self.metrics.increment("inference.batches")
         self.metrics.observe("inference.batch_size", float(len(batch)))
@@ -473,19 +508,32 @@ class HFInferenceEngine:
                 action=action,
                 token_logprobs=output["token_logprobs"],
                 metadata={
-                    "engine_policy_version": self.loaded_policy.policy_version,
+                    "engine_policy_version": self.current_policy(actor_id=pending.request.actor_id).policy_version,
                     "served_policy_version": pending.request.policy.policy_version,
                     "policy_load_latency_ms": policy_load_latency_ms,
                     "batch_size": len(batch),
                     "backend": "hf",
+                    "fleet_policy_version": self.loaded_policy.policy_version,
                 },
             )
             if not pending.future.done():
                 pending.future.set_result(result)
 
-    async def ensure_policy_loaded(self, policy: PolicyRef) -> float:
+    async def ensure_policy_loaded(self, policy: PolicyRef, *, actor_id: str | None = None) -> float:
         model_source = self.resolve_model_source(policy)
+        if actor_id is not None:
+            actor_policy = self.actor_loaded_policies.get(actor_id)
+            actor_source = self.actor_loaded_sources.get(actor_id)
+            if (
+                actor_policy is not None
+                and actor_policy.policy_version == policy.policy_version
+                and actor_source == model_source
+            ):
+                return 0.0
         if self.loaded_policy.policy_version == policy.policy_version and self.loaded_model_source == model_source:
+            if actor_id is not None:
+                self.actor_loaded_policies[actor_id] = policy
+                self.actor_loaded_sources[actor_id] = model_source
             return 0.0
         started_ts = utc_ts()
         bundle: HFBackendBundle = await asyncio.get_running_loop().run_in_executor(
@@ -498,6 +546,9 @@ class HFInferenceEngine:
         self.loaded_model = bundle["model"]
         self.loaded_model_source = model_source
         self.loaded_policy = policy
+        if actor_id is not None:
+            self.actor_loaded_policies[actor_id] = policy
+            self.actor_loaded_sources[actor_id] = model_source
         ended_ts = utc_ts()
         latency_ms = (ended_ts - started_ts) * 1000.0
         self.metrics.increment("inference.policy_refresh_count")
@@ -582,6 +633,7 @@ class HFInferenceEngine:
         order: list[tuple[object, ...]] = []
         for pending in batch:
             signature = (
+                pending.request.actor_id,
                 pending.request.policy.policy_version,
                 pending.request.max_new_tokens,
                 round(pending.request.temperature, 6),
@@ -616,10 +668,12 @@ class VLLMInferenceEngine:
     async def submit_many(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
         return [await self.submit(request) for request in requests]
 
-    async def refresh_policy(self, policy: PolicyRef) -> None:
+    async def refresh_policy(self, policy: PolicyRef, *, actor_id: str | None = None) -> None:
+        del actor_id
         self.loaded_policy = policy
 
-    def current_policy(self) -> PolicyRef:
+    def current_policy(self, *, actor_id: str | None = None) -> PolicyRef:
+        del actor_id
         return self.loaded_policy
 
     def metrics_snapshot(self) -> MetricsSnapshot:
