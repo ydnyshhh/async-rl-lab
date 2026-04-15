@@ -212,7 +212,9 @@ class Trajectory(JsonSerializable):
     terminal_reward: float | None = None
     is_truncated: bool = False
     behavior_logprobs: tuple[float, ...] | None = None
+    behavior_token_logprobs: tuple[tuple[float, ...], ...] | None = None
     reference_logprobs: tuple[float, ...] | None = None
+    reference_token_logprobs: tuple[tuple[float, ...], ...] | None = None
     logprob_stats: dict[str, float] = field(default_factory=dict)
     invalid_action_count: int = 0
     generation_latency_ms: float | None = None

@@ -10,6 +10,20 @@ uv run async-rl-demo
 uv run python -m unittest discover -s tests -v
 ```
 
+Optional Hugging Face backend:
+
+```powershell
+uv sync --extra hf
+```
+
+Dev checks:
+
+```powershell
+uv sync --group dev
+uv run --group dev ruff check .
+uv run --group dev mypy src
+```
+
 Implementation guide:
 - `docs/implementation_spec.md`
 

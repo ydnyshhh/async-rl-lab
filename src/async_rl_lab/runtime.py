@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
+from typing import Protocol
 
 from async_rl_lab.buffer import InMemoryGroupedRolloutBuffer
 from async_rl_lab.environments import EnvironmentSession, TaskSpec
@@ -32,10 +33,54 @@ class LearnerConfig:
     learning_rate: float = 0.05
 
 
+class TaskSource(Protocol):
+    async def next_task(self) -> TaskSpec | None:
+        ...
+
+
+class RoundRobinTaskSource:
+    def __init__(self, tasks: Iterable[TaskSpec], *, repeat: bool = True) -> None:
+        self.tasks = tuple(tasks)
+        self.repeat = repeat
+        self.lock = asyncio.Lock()
+        self.index = 0
+
+    async def next_task(self) -> TaskSpec | None:
+        async with self.lock:
+            if not self.tasks:
+                return None
+            if not self.repeat and self.index >= len(self.tasks):
+                return None
+            task = self.tasks[self.index % len(self.tasks)]
+            self.index += 1
+            return task
+
+
+class PendingVerifiedGroupAssembler:
+    def __init__(self, required_group_size: int) -> None:
+        self.required_group_size = required_group_size
+        self.pending: dict[str, dict[int, Trajectory]] = {}
+
+    def add(self, trajectory: Trajectory) -> tuple[Trajectory, ...] | None:
+        entries = self.pending.setdefault(trajectory.group_id, {})
+        entries[trajectory.sample_index_within_group] = trajectory
+        if len(entries) < self.required_group_size:
+            return None
+        ordered = tuple(entries[index] for index in sorted(entries))
+        del self.pending[trajectory.group_id]
+        return ordered
+
+    def pending_group_count(self) -> int:
+        return len(self.pending)
+
+    def pending_sample_count(self) -> int:
+        return sum(len(entries) for entries in self.pending.values())
+
+
 async def actor_main_loop(
     *,
     actor_id: str,
-    task_stream: Iterable[TaskSpec],
+    task_stream: Iterable[TaskSpec] | TaskSource,
     environment,
     inference_engine: InferenceEngine,
     verifier: Verifier,
@@ -44,10 +89,11 @@ async def actor_main_loop(
     event_logger: JsonlEventLogger,
     stop_event: asyncio.Event,
     config: ActorConfig,
+    verifier_pending_queue: asyncio.Queue[Trajectory] | None = None,
 ) -> None:
     completed_episodes = 0
     failed_episodes = 0
-    task_iterator = iter(task_stream)
+    task_iterator = iter(task_stream) if not hasattr(task_stream, "next_task") else None
     last_heartbeat_ts = 0.0
 
     while not stop_event.is_set():
@@ -82,10 +128,8 @@ async def actor_main_loop(
             )
             last_heartbeat_ts = now_ts
 
-        try:
-            task = next(task_iterator)
-        except StopIteration:
-            stop_event.set()
+        task = await next_task_from_source(task_stream, task_iterator)
+        if task is None:
             return
 
         policy_ref = await policy_refresh_logic(
@@ -110,6 +154,7 @@ async def actor_main_loop(
                     policy_ref=policy_ref,
                     event_logger=event_logger,
                     config=config,
+                    inline_verify=verifier_pending_queue is None,
                 )
                 group_trajectories.append(trajectory)
                 completed_episodes += 1
@@ -125,18 +170,29 @@ async def actor_main_loop(
                 break
 
         if len(group_trajectories) == config.group_size:
-            insert_result = rollout_buffer.insert_group(tuple(group_trajectories))
-            event_logger.log(
-                "TrajectoryQueued",
-                actor_id=actor_id,
-                policy_version=policy_ref.policy_version,
-                group_id=group_id,
-                payload={
-                    "inserted_group_id": insert_result.inserted_group_id,
-                    "inserted_trajectories": insert_result.inserted_trajectories,
-                    "dropped_group_ids": list(insert_result.dropped_group_ids),
-                },
-            )
+            if verifier_pending_queue is None:
+                insert_result = rollout_buffer.insert_group(tuple(group_trajectories))
+                event_logger.log(
+                    "TrajectoryQueued",
+                    actor_id=actor_id,
+                    policy_version=policy_ref.policy_version,
+                    group_id=group_id,
+                    payload={
+                        "inserted_group_id": insert_result.inserted_group_id,
+                        "inserted_trajectories": insert_result.inserted_trajectories,
+                        "dropped_group_ids": list(insert_result.dropped_group_ids),
+                    },
+                )
+            else:
+                for trajectory in group_trajectories:
+                    await verifier_pending_queue.put(trajectory)
+                event_logger.log(
+                    "TrajectoryQueuedForVerification",
+                    actor_id=actor_id,
+                    policy_version=policy_ref.policy_version,
+                    group_id=group_id,
+                    payload={"queued_trajectories": len(group_trajectories)},
+                )
 
 
 async def execute_episode(
@@ -151,6 +207,7 @@ async def execute_episode(
     policy_ref: PolicyRef,
     event_logger: JsonlEventLogger,
     config: ActorConfig,
+    inline_verify: bool = True,
 ) -> Trajectory:
     session: EnvironmentSession = await environment.start_episode(task, actor_id, policy_ref)
     event_logger.log(
@@ -202,6 +259,16 @@ async def execute_episode(
         generation_results=generation_results,
         generated_text=" ".join(generated_text_parts),
     )
+    if not inline_verify:
+        event_logger.log(
+            "ActorEpisodeFinished",
+            actor_id=actor_id,
+            policy_version=policy_ref.policy_version,
+            group_id=group_id,
+            trajectory_id=trajectory.trajectory_id,
+            payload={"task_id": task.task_id, "reward_pending": True, "env_steps": trajectory.env_steps},
+        )
+        return trajectory
     verifier_start_ts = utc_ts()
     reward_result = await verifier.verify(replace(trajectory, verifier_start_ts=verifier_start_ts))
     verifier_end_ts = utc_ts()
@@ -240,6 +307,7 @@ def build_trajectory(
     parsed_actions = tuple(transition.action for transition in episode.transitions)
     observations = tuple(session.observations)
     per_step_rewards = tuple(transition.reward or 0.0 for transition in episode.transitions)
+    behavior_token_logprobs = tuple(result.token_logprobs or () for result in generation_results)
     behavior_logprobs = tuple(
         sum(result.token_logprobs or ()) / len(result.token_logprobs) if result.token_logprobs else -0.1
         for result in generation_results
@@ -271,6 +339,7 @@ def build_trajectory(
         metadata=episode.metadata,
         is_truncated=episode.is_truncated,
         behavior_logprobs=behavior_logprobs,
+        behavior_token_logprobs=behavior_token_logprobs,
         logprob_stats={"mean_behavior_logprob": sum(behavior_logprobs) / len(behavior_logprobs) if behavior_logprobs else 0.0},
         invalid_action_count=sum(1 for action in parsed_actions if action.action_type == "invalid"),
         generation_latency_ms=sum(result.latency_ms for result in generation_results),
@@ -415,10 +484,12 @@ async def verifier_loop(
     stop_event: asyncio.Event,
     event_logger: JsonlEventLogger,
 ) -> None:
-    while not stop_event.is_set():
+    while True:
         try:
             trajectory = await asyncio.wait_for(pending_queue.get(), timeout=0.05)
         except asyncio.TimeoutError:
+            if stop_event.is_set() and pending_queue.empty():
+                break
             continue
         event_logger.log(
             "VerifierStarted",
@@ -443,6 +514,51 @@ async def verifier_loop(
             trajectory_id=trajectory.trajectory_id,
             group_id=trajectory.group_id,
             payload={"reward": reward_result.reward_value},
+        )
+
+
+async def verified_group_collector_loop(
+    *,
+    completed_queue: asyncio.Queue[Trajectory],
+    rollout_buffer: InMemoryGroupedRolloutBuffer,
+    required_group_size: int,
+    stop_event: asyncio.Event,
+    event_logger: JsonlEventLogger,
+) -> None:
+    assembler = PendingVerifiedGroupAssembler(required_group_size)
+    while True:
+        try:
+            trajectory = await asyncio.wait_for(completed_queue.get(), timeout=0.05)
+        except asyncio.TimeoutError:
+            if stop_event.is_set() and completed_queue.empty() and assembler.pending_group_count() == 0:
+                break
+            continue
+
+        maybe_group = assembler.add(trajectory)
+        event_logger.log(
+            "VerifiedTrajectoryCollected",
+            trajectory_id=trajectory.trajectory_id,
+            group_id=trajectory.group_id,
+            payload={
+                "pending_groups": assembler.pending_group_count(),
+                "pending_samples": assembler.pending_sample_count(),
+            },
+        )
+        if maybe_group is None:
+            continue
+
+        insert_result = rollout_buffer.insert_group(maybe_group)
+        event_logger.log(
+            "TrajectoryQueued",
+            actor_id=maybe_group[0].actor_id,
+            policy_version=maybe_group[0].behavior_policy_version,
+            group_id=maybe_group[0].group_id,
+            payload={
+                "inserted_group_id": insert_result.inserted_group_id,
+                "inserted_trajectories": insert_result.inserted_trajectories,
+                "dropped_group_ids": list(insert_result.dropped_group_ids),
+                "source": "verified_group_collector_loop",
+            },
         )
 
 
@@ -483,3 +599,17 @@ def mean_behavior_logprob(trajectories: tuple[Trajectory, ...]) -> float:
         if trajectory.behavior_logprobs:
             summaries.append(sum(trajectory.behavior_logprobs) / len(trajectory.behavior_logprobs))
     return sum(summaries) / len(summaries) if summaries else 0.0
+
+
+async def next_task_from_source(
+    task_stream: Iterable[TaskSpec] | TaskSource,
+    task_iterator,
+) -> TaskSpec | None:
+    if hasattr(task_stream, "next_task"):
+        return await task_stream.next_task()
+    if task_iterator is None:
+        return None
+    try:
+        return next(task_iterator)
+    except StopIteration:
+        return None

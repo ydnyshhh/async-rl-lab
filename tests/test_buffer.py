@@ -26,6 +26,7 @@ def make_trajectory(
     reward: float = 1.0,
     answer_text: str = "4",
     raw_text: str | None = None,
+    expected_answer: str | None = None,
 ) -> Trajectory:
     policy = make_policy(policy_version)
     sequence_text = raw_text or f'{{"type":"finish","answer":"{answer_text}"}}'
@@ -81,6 +82,7 @@ def make_trajectory(
         tool_calls=(),
         tool_results=(),
         per_step_rewards=(reward,),
+        metadata={"expected_answer": expected_answer or answer_text},
         terminal_reward=reward,
         behavior_logprobs=(-0.1,),
     )

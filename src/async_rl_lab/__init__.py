@@ -26,6 +26,7 @@ from async_rl_lab.models import (
 )
 from async_rl_lab.objectives import DAPOObjective, GRPOObjective, StalenessWeightedGRPO
 from async_rl_lab.policy_store import LocalPolicyStore, PolicyUpdateStats, SequencePolicyState, SequenceScore
+from async_rl_lab.runtime import PendingVerifiedGroupAssembler, RoundRobinTaskSource, verified_group_collector_loop, verifier_loop
 
 __all__ = [
     "Action",
@@ -45,9 +46,11 @@ __all__ = [
     "LocalPolicyStore",
     "MockInferenceEngine",
     "Observation",
+    "PendingVerifiedGroupAssembler",
     "PolicyUpdateStats",
     "PolicyRef",
     "RewardResult",
+    "RoundRobinTaskSource",
     "SequencePolicyState",
     "SequenceScore",
     "StalenessStats",
@@ -58,4 +61,6 @@ __all__ = [
     "Transition",
     "VLLMInferenceEngine",
     "parse_action_text",
+    "verified_group_collector_loop",
+    "verifier_loop",
 ]

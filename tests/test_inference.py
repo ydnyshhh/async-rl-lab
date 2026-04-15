@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 
 from async_rl_lab.ids import make_id, utc_ts
-from async_rl_lab.inference import MockInferenceEngine
+from async_rl_lab.inference import HFInferenceEngine, MockInferenceEngine
 from async_rl_lab.models import GenerationRequest
 from async_rl_lab.policy_store import LocalPolicyStore
 
@@ -122,3 +122,67 @@ class InferenceEngineTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(result_v1.metadata["served_policy_version"], policy_v1.policy_version)
             self.assertEqual(result_v2.metadata["served_policy_version"], policy_v2.policy_version)
+
+    async def test_hf_engine_queue_and_metrics_without_external_model(self) -> None:
+        class FakeHFInferenceEngine(HFInferenceEngine):
+            async def ensure_policy_loaded(self, policy):
+                self.loaded_policy = policy
+                return 0.0
+
+            def generate_batch_sync(self, prompt_texts, batch):
+                return [
+                    {
+                        "generated_text": '{"type":"finish","answer":"4"}',
+                        "prompt_tokens": 4,
+                        "completion_tokens": 3,
+                        "token_logprobs": (),
+                    }
+                    for _ in batch
+                ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            policy_store = LocalPolicyStore(root, run_id="run-test")
+            policy = policy_store.current_policy()
+            engine = FakeHFInferenceEngine(policy)
+            request = GenerationRequest(
+                request_id=make_id("req"),
+                task_id="task-0",
+                prompt_id="prompt-0",
+                group_id="group-0",
+                sample_index_within_group=0,
+                actor_id="actor-0",
+                policy=policy,
+                observation_text="What is 2 + 2?",
+                available_tools=(),
+                max_new_tokens=16,
+                temperature=0.0,
+                top_p=1.0,
+                created_ts=utc_ts(),
+            )
+
+            result = await engine.submit(request)
+            await engine.close()
+            restarted_result = await engine.submit(
+                GenerationRequest(
+                    request_id=make_id("req"),
+                    task_id="task-1",
+                    prompt_id="prompt-1",
+                    group_id="group-1",
+                    sample_index_within_group=0,
+                    actor_id="actor-0",
+                    policy=policy,
+                    observation_text="What is 3 + 3?",
+                    available_tools=(),
+                    max_new_tokens=16,
+                    temperature=0.0,
+                    top_p=1.0,
+                    created_ts=utc_ts(),
+                )
+            )
+            await engine.close()
+
+            self.assertEqual(result.metadata["backend"], "hf")
+            self.assertEqual(result.generated_text, '{"type":"finish","answer":"4"}')
+            self.assertEqual(restarted_result.metadata["backend"], "hf")
+            self.assertGreater(engine.metrics_snapshot().counters.get("inference.requests", 0.0), 0.0)
