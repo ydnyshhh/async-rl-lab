@@ -539,6 +539,8 @@ class HFInferenceEngine:
             **self.generation_defaults,
             "max_new_tokens": request.max_new_tokens,
             "pad_token_id": getattr(tokenizer, "pad_token_id", None) or getattr(tokenizer, "eos_token_id", None),
+            "return_dict_in_generate": True,
+            "output_scores": True,
         }
         do_sample = request.temperature > 1e-3
         if do_sample:
@@ -549,19 +551,28 @@ class HFInferenceEngine:
             generation_kwargs["do_sample"] = False
         with torch.inference_mode():
             outputs = model.generate(**inputs, **generation_kwargs)
+        sequences = outputs.sequences
         input_width = int(inputs["input_ids"].shape[1])
-        completion_ids = outputs[:, input_width:]
+        completion_ids = sequences[:, input_width:]
         decoded = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+        special_token_ids = collect_special_token_ids(tokenizer)
         results: list[BackendGenerationOutput] = []
         for index, generated_text in enumerate(decoded):
-            completion_tokens = sequence_length(completion_ids[index])
+            token_logprobs = extract_generated_token_logprobs(
+                torch_module=torch,
+                score_steps=outputs.scores,
+                completion_ids=completion_ids[index],
+                batch_index=index,
+                special_token_ids=special_token_ids,
+            )
+            completion_tokens = len(token_logprobs)
             prompt_tokens = sequence_length(inputs["attention_mask"][index])
             results.append(
                 {
                     "generated_text": generated_text.strip(),
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
-                    "token_logprobs": (),
+                    "token_logprobs": token_logprobs,
                 }
             )
         return results
@@ -662,3 +673,34 @@ def load_torch_module():
 def sequence_length(value) -> int:
     summed = value.sum() if hasattr(value, "sum") else len(value)
     return int(summed.item()) if hasattr(summed, "item") else int(summed)
+
+
+def collect_special_token_ids(tokenizer: Any) -> set[int]:
+    token_ids = set()
+    for name in ("pad_token_id", "eos_token_id", "bos_token_id", "sep_token_id", "cls_token_id"):
+        value = getattr(tokenizer, name, None)
+        if isinstance(value, int):
+            token_ids.add(value)
+    return token_ids
+
+
+def extract_generated_token_logprobs(
+    *,
+    torch_module: Any,
+    score_steps: Sequence[Any],
+    completion_ids,
+    batch_index: int,
+    special_token_ids: set[int],
+) -> tuple[float, ...]:
+    token_logprobs: list[float] = []
+    completion_width = int(completion_ids.shape[0]) if hasattr(completion_ids, "shape") else len(completion_ids)
+    step_count = min(len(score_steps), completion_width)
+    for step_index in range(step_count):
+        token_value = completion_ids[step_index]
+        token_id = int(token_value.item()) if hasattr(token_value, "item") else int(token_value)
+        if token_id in special_token_ids:
+            continue
+        step_scores = score_steps[step_index][batch_index]
+        logprob = torch_module.log_softmax(step_scores, dim=-1)[token_id]
+        token_logprobs.append(float(logprob.item()) if hasattr(logprob, "item") else float(logprob))
+    return tuple(token_logprobs)

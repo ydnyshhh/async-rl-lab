@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import math
 import unittest
 from pathlib import Path
 import tempfile
 
 from async_rl_lab.ids import make_id, utc_ts
-from async_rl_lab.inference import HFInferenceEngine, MockInferenceEngine
+from async_rl_lab.inference import HFInferenceEngine, MockInferenceEngine, extract_generated_token_logprobs
 from async_rl_lab.models import GenerationRequest
 from async_rl_lab.policy_store import LocalPolicyStore
 
@@ -186,3 +187,67 @@ class InferenceEngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.generated_text, '{"type":"finish","answer":"4"}')
             self.assertEqual(restarted_result.metadata["backend"], "hf")
             self.assertGreater(engine.metrics_snapshot().counters.get("inference.requests", 0.0), 0.0)
+
+    async def test_publish_policy_preserves_hf_model_source_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            model_dir = root / "hf-model"
+            model_dir.mkdir()
+            (model_dir / "config.json").write_text("{}", encoding="utf-8")
+            policy_store = LocalPolicyStore(root, run_id="run-test")
+            referenced_policy = await policy_store.publish_policy(
+                checkpoint_step=1,
+                policy_tag="hf-ref",
+                inference_model_name_or_path=str(model_dir),
+            )
+            updated = policy_store.train_on_sequences(
+                policy_version=referenced_policy.policy_version,
+                sequences=['{"type":"finish","answer":"4"}'],
+                advantages=(1.0,),
+                sequence_weights=(1.0,),
+                learning_rate=0.1,
+            )
+            propagated_policy = await policy_store.publish_policy(
+                checkpoint_step=2,
+                policy_tag="hf-ref-updated",
+                state=updated.updated_state,
+                metadata={"note": "propagated"},
+            )
+            engine = HFInferenceEngine(propagated_policy, model_name_or_path="fallback-model")
+
+            self.assertEqual(
+                propagated_policy.metadata["hf_model_name_or_path"],
+                str(model_dir),
+            )
+            self.assertEqual(engine.resolve_model_source(propagated_policy), str(model_dir))
+
+    def test_extract_generated_token_logprobs_skips_special_tokens(self) -> None:
+        class FakeValue(float):
+            def item(self):
+                return float(self)
+
+        class FakeTorchModule:
+            @staticmethod
+            def log_softmax(row, dim=-1):
+                del dim
+                values = [float(item) for item in row]
+                max_value = max(values)
+                total = sum(math.exp(value - max_value) for value in values)
+                return [FakeValue(value - max_value - math.log(total)) for value in values]
+
+        score_steps = [
+            [[1.0, 0.0, -1.0], [0.0, 1.0, -1.0]],
+            [[0.0, 1.0, -1.0], [1.0, 0.0, -1.0]],
+        ]
+        completion_ids = [0, 1]
+
+        token_logprobs = extract_generated_token_logprobs(
+            torch_module=FakeTorchModule(),
+            score_steps=score_steps,
+            completion_ids=completion_ids,
+            batch_index=0,
+            special_token_ids={0},
+        )
+
+        self.assertEqual(len(token_logprobs), 1)
+        self.assertLess(token_logprobs[0], 0.0)

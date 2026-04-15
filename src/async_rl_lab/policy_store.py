@@ -90,6 +90,7 @@ class LocalPolicyStore:
         checkpoint_step: int,
         policy_tag: str,
         checkpoint_path: str | None = None,
+        inference_model_name_or_path: str | None = None,
         metadata: dict[str, JsonValue] | None = None,
         state: SequencePolicyState | None = None,
     ) -> PolicyRef:
@@ -97,6 +98,9 @@ class LocalPolicyStore:
             next_state = self.clone_state(state or self.current_state)
             next_version = self.current.policy_version + 1
             state_path = checkpoint_path or str(self.state_path_for(next_version))
+            next_metadata = dict(metadata or {})
+            if inference_model_name_or_path is not None:
+                next_metadata["hf_model_name_or_path"] = inference_model_name_or_path
             next_policy = PolicyRef(
                 run_id=self.run_id,
                 policy_version=next_version,
@@ -106,7 +110,11 @@ class LocalPolicyStore:
                 model_family=self.model_family,
                 policy_path=state_path,
                 parent_policy_version=self.current.policy_version,
-                metadata=self.policy_metadata(next_state, extra=metadata),
+                metadata=self.policy_metadata(
+                    next_state,
+                    inherited=self.current.metadata,
+                    extra=next_metadata,
+                ),
             )
             self.write_policy_files(next_policy, next_state)
             self.current_state = next_state
@@ -258,9 +266,11 @@ class LocalPolicyStore:
         self,
         state: SequencePolicyState,
         *,
+        inherited: dict[str, JsonValue] | None = None,
         extra: dict[str, JsonValue] | None = None,
     ) -> dict[str, JsonValue]:
         return {
+            **(inherited or {}),
             "vocab_size": len(state.token_logits),
             "update_count": state.update_count,
             "tokens_seen": state.tokens_seen,

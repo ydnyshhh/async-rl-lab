@@ -47,6 +47,7 @@ async def run_demo() -> None:
     stop_event = asyncio.Event()
     pending_verification_queue: asyncio.Queue = asyncio.Queue()
     completed_verification_queue: asyncio.Queue = asyncio.Queue()
+    verifier_done_event = asyncio.Event()
     actor_tasks = [
         asyncio.create_task(
         actor_main_loop(
@@ -72,6 +73,7 @@ async def run_demo() -> None:
             completed_queue=completed_verification_queue,
             stop_event=stop_event,
             event_logger=logger,
+            done_event=verifier_done_event,
         )
     )
     collector_task = asyncio.create_task(
@@ -81,6 +83,7 @@ async def run_demo() -> None:
             required_group_size=4,
             stop_event=stop_event,
             event_logger=logger,
+            upstream_done_event=verifier_done_event,
         )
     )
     learner_results = await learner_main_loop(

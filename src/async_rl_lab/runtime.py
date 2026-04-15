@@ -483,38 +483,46 @@ async def verifier_loop(
     completed_queue: asyncio.Queue[Trajectory],
     stop_event: asyncio.Event,
     event_logger: JsonlEventLogger,
+    done_event: asyncio.Event | None = None,
 ) -> None:
-    while True:
-        try:
-            trajectory = await asyncio.wait_for(pending_queue.get(), timeout=0.05)
-        except asyncio.TimeoutError:
-            if stop_event.is_set() and pending_queue.empty():
-                break
-            continue
-        event_logger.log(
-            "VerifierStarted",
-            trajectory_id=trajectory.trajectory_id,
-            group_id=trajectory.group_id,
-            payload={"task_id": trajectory.task_id},
-        )
-        verifier_start_ts = utc_ts()
-        reward_result = await verifier.verify(trajectory)
-        verifier_end_ts = utc_ts()
-        completed = replace(
-            trajectory,
-            verifier_start_ts=verifier_start_ts,
-            verifier_end_ts=verifier_end_ts,
-            verifier_latency_ms=(verifier_end_ts - verifier_start_ts) * 1000.0,
-            terminal_reward=reward_result.reward_value,
-            reward_result=reward_result,
-        )
-        await completed_queue.put(completed)
-        event_logger.log(
-            "VerifierFinished",
-            trajectory_id=trajectory.trajectory_id,
-            group_id=trajectory.group_id,
-            payload={"reward": reward_result.reward_value},
-        )
+    try:
+        while True:
+            try:
+                trajectory = await asyncio.wait_for(pending_queue.get(), timeout=0.05)
+            except asyncio.TimeoutError:
+                if stop_event.is_set() and pending_queue.empty():
+                    break
+                continue
+            try:
+                event_logger.log(
+                    "VerifierStarted",
+                    trajectory_id=trajectory.trajectory_id,
+                    group_id=trajectory.group_id,
+                    payload={"task_id": trajectory.task_id},
+                )
+                verifier_start_ts = utc_ts()
+                reward_result = await verifier.verify(trajectory)
+                verifier_end_ts = utc_ts()
+                completed = replace(
+                    trajectory,
+                    verifier_start_ts=verifier_start_ts,
+                    verifier_end_ts=verifier_end_ts,
+                    verifier_latency_ms=(verifier_end_ts - verifier_start_ts) * 1000.0,
+                    terminal_reward=reward_result.reward_value,
+                    reward_result=reward_result,
+                )
+                await completed_queue.put(completed)
+                event_logger.log(
+                    "VerifierFinished",
+                    trajectory_id=trajectory.trajectory_id,
+                    group_id=trajectory.group_id,
+                    payload={"reward": reward_result.reward_value},
+                )
+            finally:
+                pending_queue.task_done()
+    finally:
+        if done_event is not None:
+            done_event.set()
 
 
 async def verified_group_collector_loop(
@@ -524,42 +532,51 @@ async def verified_group_collector_loop(
     required_group_size: int,
     stop_event: asyncio.Event,
     event_logger: JsonlEventLogger,
+    upstream_done_event: asyncio.Event | None = None,
 ) -> None:
     assembler = PendingVerifiedGroupAssembler(required_group_size)
     while True:
         try:
             trajectory = await asyncio.wait_for(completed_queue.get(), timeout=0.05)
         except asyncio.TimeoutError:
-            if stop_event.is_set() and completed_queue.empty() and assembler.pending_group_count() == 0:
+            if (
+                stop_event.is_set()
+                and completed_queue.empty()
+                and assembler.pending_group_count() == 0
+                and (upstream_done_event is None or upstream_done_event.is_set())
+            ):
                 break
             continue
 
-        maybe_group = assembler.add(trajectory)
-        event_logger.log(
-            "VerifiedTrajectoryCollected",
-            trajectory_id=trajectory.trajectory_id,
-            group_id=trajectory.group_id,
-            payload={
-                "pending_groups": assembler.pending_group_count(),
-                "pending_samples": assembler.pending_sample_count(),
-            },
-        )
-        if maybe_group is None:
-            continue
+        try:
+            maybe_group = assembler.add(trajectory)
+            event_logger.log(
+                "VerifiedTrajectoryCollected",
+                trajectory_id=trajectory.trajectory_id,
+                group_id=trajectory.group_id,
+                payload={
+                    "pending_groups": assembler.pending_group_count(),
+                    "pending_samples": assembler.pending_sample_count(),
+                },
+            )
+            if maybe_group is None:
+                continue
 
-        insert_result = rollout_buffer.insert_group(maybe_group)
-        event_logger.log(
-            "TrajectoryQueued",
-            actor_id=maybe_group[0].actor_id,
-            policy_version=maybe_group[0].behavior_policy_version,
-            group_id=maybe_group[0].group_id,
-            payload={
-                "inserted_group_id": insert_result.inserted_group_id,
-                "inserted_trajectories": insert_result.inserted_trajectories,
-                "dropped_group_ids": list(insert_result.dropped_group_ids),
-                "source": "verified_group_collector_loop",
-            },
-        )
+            insert_result = rollout_buffer.insert_group(maybe_group)
+            event_logger.log(
+                "TrajectoryQueued",
+                actor_id=maybe_group[0].actor_id,
+                policy_version=maybe_group[0].behavior_policy_version,
+                group_id=maybe_group[0].group_id,
+                payload={
+                    "inserted_group_id": insert_result.inserted_group_id,
+                    "inserted_trajectories": insert_result.inserted_trajectories,
+                    "dropped_group_ids": list(insert_result.dropped_group_ids),
+                    "source": "verified_group_collector_loop",
+                },
+            )
+        finally:
+            completed_queue.task_done()
 
 
 async def policy_refresh_logic(

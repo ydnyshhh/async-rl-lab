@@ -115,6 +115,7 @@ class RuntimeLoopTests(unittest.IsolatedAsyncioTestCase):
             buffer = InMemoryGroupedRolloutBuffer(capacity_groups=2, required_group_size=2)
             logger = JsonlEventLogger(root / "events.jsonl", run_id="run-test")
             stop_event = asyncio.Event()
+            verifier_done_event = asyncio.Event()
             verifier_task = asyncio.create_task(
                 verifier_loop(
                     verifier=DelayedVerifierWrapper(ExactMatchVerifier(), delay_ms=1.0),
@@ -122,6 +123,7 @@ class RuntimeLoopTests(unittest.IsolatedAsyncioTestCase):
                     completed_queue=completed_queue,
                     stop_event=stop_event,
                     event_logger=logger,
+                    done_event=verifier_done_event,
                 )
             )
             collector_task = asyncio.create_task(
@@ -131,6 +133,7 @@ class RuntimeLoopTests(unittest.IsolatedAsyncioTestCase):
                     required_group_size=2,
                     stop_event=stop_event,
                     event_logger=logger,
+                    upstream_done_event=verifier_done_event,
                 )
             )
             await pending_queue.put(make_trajectory("group-a", 0, 0, answer_text="4", expected_answer="4"))
@@ -144,6 +147,43 @@ class RuntimeLoopTests(unittest.IsolatedAsyncioTestCase):
             batch = buffer.sample_groups(max_groups=1, learner_policy_version=0)
             self.assertEqual(len(batch.trajectories), 2)
             self.assertEqual(tuple(t.terminal_reward for t in batch.trajectories), (1.0, 0.0))
+
+    async def test_collector_waits_for_verifier_to_finish_before_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pending_queue: asyncio.Queue = asyncio.Queue()
+            completed_queue: asyncio.Queue = asyncio.Queue()
+            buffer = InMemoryGroupedRolloutBuffer(capacity_groups=2, required_group_size=1)
+            logger = JsonlEventLogger(root / "events.jsonl", run_id="run-test")
+            stop_event = asyncio.Event()
+            verifier_done_event = asyncio.Event()
+            verifier_task = asyncio.create_task(
+                verifier_loop(
+                    verifier=DelayedVerifierWrapper(ExactMatchVerifier(), delay_ms=50.0),
+                    pending_queue=pending_queue,
+                    completed_queue=completed_queue,
+                    stop_event=stop_event,
+                    event_logger=logger,
+                    done_event=verifier_done_event,
+                )
+            )
+            collector_task = asyncio.create_task(
+                verified_group_collector_loop(
+                    completed_queue=completed_queue,
+                    rollout_buffer=buffer,
+                    required_group_size=1,
+                    stop_event=stop_event,
+                    event_logger=logger,
+                    upstream_done_event=verifier_done_event,
+                )
+            )
+            await pending_queue.put(make_trajectory("group-a", 0, 0, answer_text="4", expected_answer="4"))
+            stop_event.set()
+            await verifier_task
+            await collector_task
+
+            self.assertEqual(buffer.group_count(), 1)
+            self.assertTrue(completed_queue.empty())
 
     async def test_round_robin_task_source_repeats(self) -> None:
         task_source = RoundRobinTaskSource(
