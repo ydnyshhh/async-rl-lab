@@ -24,9 +24,9 @@ from async_rl_lab.models import (
     Trajectory,
     Transition,
 )
-from async_rl_lab.objectives import DAPOObjective, GRPOObjective, StalenessWeightedGRPO
+from async_rl_lab.objectives import DAPOObjective, GRPOObjective, ObjectiveResult, PreparedBatch, RescoredBatch, StalenessWeightedGRPO
 from async_rl_lab.policy_store import LocalPolicyStore, PolicyUpdateStats, SequencePolicyState, SequenceScore
-from async_rl_lab.runtime import PendingVerifiedGroupAssembler, RoundRobinTaskSource, verified_group_collector_loop, verifier_loop
+from async_rl_lab.runtime import PendingVerifiedGroupAssembler, PolicyAdoptionController, RoundRobinTaskSource, policy_adoption_loop, verified_group_collector_loop, verifier_loop
 
 __all__ = [
     "Action",
@@ -45,11 +45,15 @@ __all__ = [
     "LearnerStepResult",
     "LocalPolicyStore",
     "MockInferenceEngine",
+    "ObjectiveResult",
     "Observation",
     "PendingVerifiedGroupAssembler",
+    "PolicyAdoptionController",
     "PolicyUpdateStats",
     "PolicyRef",
+    "PreparedBatch",
     "RewardResult",
+    "RescoredBatch",
     "RoundRobinTaskSource",
     "SequencePolicyState",
     "SequenceScore",
@@ -61,6 +65,7 @@ __all__ = [
     "Transition",
     "VLLMInferenceEngine",
     "parse_action_text",
+    "policy_adoption_loop",
     "verified_group_collector_loop",
     "verifier_loop",
 ]

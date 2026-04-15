@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
+import random
 from typing import Protocol
 
 from async_rl_lab.buffer import InMemoryGroupedRolloutBuffer
@@ -11,7 +12,7 @@ from async_rl_lab.events import JsonlEventLogger
 from async_rl_lab.ids import make_id, utc_ts
 from async_rl_lab.inference import InferenceEngine
 from async_rl_lab.models import Action, ActorHeartbeat, GenerationRequest, LearnerStepResult, PolicyRef, Trajectory
-from async_rl_lab.objectives import Objective
+from async_rl_lab.objectives import Objective, RescoredBatch
 from async_rl_lab.policy_store import LocalPolicyStore
 from async_rl_lab.verifiers import Verifier
 
@@ -31,6 +32,40 @@ class LearnerConfig:
     max_groups_per_batch: int = 2
     publish_every_steps: int = 1
     learning_rate: float = 0.05
+
+
+class PolicyAdoptionController:
+    def __init__(
+        self,
+        initial_policy: PolicyRef,
+        *,
+        adoption_delay_ms: float = 0.0,
+        adoption_jitter_ms: float = 0.0,
+    ) -> None:
+        self.latest_published = initial_policy
+        self.latest_adopted = initial_policy
+        self.adoption_delay_ms = adoption_delay_ms
+        self.adoption_jitter_ms = adoption_jitter_ms
+        self.pending_queue: asyncio.Queue[PolicyRef] = asyncio.Queue()
+        self.lock = asyncio.Lock()
+
+    async def note_published(self, policy: PolicyRef) -> None:
+        async with self.lock:
+            self.latest_published = policy
+        await self.pending_queue.put(policy)
+
+    async def mark_adopted(self, policy: PolicyRef) -> None:
+        async with self.lock:
+            self.latest_adopted = policy
+
+    def current_published_policy(self) -> PolicyRef:
+        return self.latest_published
+
+    def current_adopted_policy(self) -> PolicyRef:
+        return self.latest_adopted
+
+    def adoption_gap(self) -> int:
+        return self.latest_published.policy_version - self.latest_adopted.policy_version
 
 
 class TaskSource(Protocol):
@@ -90,6 +125,7 @@ async def actor_main_loop(
     stop_event: asyncio.Event,
     config: ActorConfig,
     verifier_pending_queue: asyncio.Queue[Trajectory] | None = None,
+    policy_adoption_controller: PolicyAdoptionController | None = None,
 ) -> None:
     completed_episodes = 0
     failed_episodes = 0
@@ -102,7 +138,11 @@ async def actor_main_loop(
         generation_latencies = inference_metrics.histograms.get("inference.latency_ms", ())
         queue_waits = inference_metrics.histograms.get("inference.queue_wait_ms", ())
         served_policy_version = inference_engine.current_policy().policy_version
-        learner_policy_version = policy_store.current_policy().policy_version
+        published_policy_version = (
+            policy_adoption_controller.current_published_policy().policy_version
+            if policy_adoption_controller is not None
+            else policy_store.current_policy().policy_version
+        )
         if now_ts - last_heartbeat_ts >= config.heartbeat_interval_s:
             heartbeat = ActorHeartbeat(
                 actor_id=actor_id,
@@ -115,8 +155,8 @@ async def actor_main_loop(
                 mean_generation_latency_ms=mean_or_none(generation_latencies),
                 mean_verifier_latency_ms=None,
                 metadata={
-                    "learner_policy_version": learner_policy_version,
-                    "policy_version_gap": learner_policy_version - served_policy_version,
+                    "published_policy_version": published_policy_version,
+                    "policy_version_gap": published_policy_version - served_policy_version,
                     "mean_queue_wait_ms": mean_or_none(queue_waits),
                 },
             )
@@ -137,6 +177,7 @@ async def actor_main_loop(
             inference_engine=inference_engine,
             policy_store=policy_store,
             event_logger=event_logger,
+            policy_adoption_controller=policy_adoption_controller,
         )
         group_id = make_id("group")
         group_trajectories: list[Trajectory] = []
@@ -357,6 +398,7 @@ async def learner_main_loop(
     stop_event: asyncio.Event,
     config: LearnerConfig,
     max_steps: int | None = None,
+    policy_adoption_controller: PolicyAdoptionController | None = None,
 ) -> list[LearnerStepResult]:
     results: list[LearnerStepResult] = []
     learner_step = 0
@@ -391,17 +433,29 @@ async def learner_main_loop(
             [trajectory.raw_text for trajectory in batch.trajectories],
             policy_version=scoring_policy.policy_version,
         )
-        model_logprob_summaries = [score.mean_logprob for score in current_scores]
-        loss = objective.compute_loss(prepared, model_logprob_summaries=model_logprob_summaries)
+        reference_policy_version = scoring_policy.parent_policy_version or scoring_policy.policy_version
+        reference_scores = policy_store.score_many(
+            [trajectory.raw_text for trajectory in batch.trajectories],
+            policy_version=reference_policy_version,
+        )
+        rescored = RescoredBatch(
+            current_policy_version=scoring_policy.policy_version,
+            reference_policy_version=reference_policy_version,
+            current_token_logprobs=tuple(score.token_logprobs for score in current_scores),
+            current_sequence_logprobs=tuple(score.total_logprob for score in current_scores),
+            reference_token_logprobs=tuple(score.token_logprobs for score in reference_scores),
+            reference_sequence_logprobs=tuple(score.total_logprob for score in reference_scores),
+        )
+        objective_result = objective.compute_loss(prepared, rescored)
         update_stats = policy_store.train_on_sequences(
             policy_version=scoring_policy.policy_version,
             sequences=[trajectory.raw_text for trajectory in batch.trajectories],
-            advantages=prepared.advantages,
-            sequence_weights=prepared.sequence_weights,
+            advantages=objective_result.update_advantages,
+            sequence_weights=tuple(1.0 for _ in batch.trajectories),
             learning_rate=config.learning_rate,
         )
         metrics = {
-            **objective.compute_metrics(prepared),
+            **objective.compute_metrics(prepared, rescored, objective_result),
             "mean_current_logprob": update_stats.mean_current_logprob,
             "mean_behavior_logprob": mean_behavior_logprob(batch.trajectories),
             "mean_rollout_age_ms": mean_or_zero(batch.staleness_stats.age_ms_by_trajectory if batch.staleness_stats else ()),
@@ -417,6 +471,7 @@ async def learner_main_loop(
                 tuple(trajectory.queue_wait_ms or 0.0 for trajectory in batch.trajectories)
             ),
             "mean_staleness_weight": mean_or_zero(prepared.sequence_weights),
+            "reference_policy_version": float(reference_policy_version),
         }
         learner_step += 1
         published_policy = None
@@ -425,18 +480,24 @@ async def learner_main_loop(
                 checkpoint_step=learner_step,
                 policy_tag=f"learner-step-{learner_step}",
                 metadata={
-                    "loss": loss,
+                    "loss": objective_result.loss,
                     "gradient_norm": update_stats.gradient_norm,
                     "mean_current_logprob": update_stats.mean_current_logprob,
                 },
                 state=update_stats.updated_state,
             )
-            await inference_engine.refresh_policy(published_policy)
+            if policy_adoption_controller is None:
+                await inference_engine.refresh_policy(published_policy)
+            else:
+                await policy_adoption_controller.note_published(published_policy)
             event_logger.log(
                 "PolicyPublished",
                 learner_step=learner_step,
                 policy_version=published_policy.policy_version,
-                payload=published_policy.to_dict(),
+                payload={
+                    **published_policy.to_dict(),
+                    "adoption_mode": "async" if policy_adoption_controller is not None else "inline",
+                },
             )
         step_end_ts = utc_ts()
         result = LearnerStepResult(
@@ -450,9 +511,9 @@ async def learner_main_loop(
             step_end_ts=step_end_ts,
             mean_reward=metrics.get("mean_reward", 0.0),
             mean_advantage=metrics.get("mean_advantage"),
-            loss=loss,
+            loss=objective_result.loss,
             gradient_norm=update_stats.gradient_norm,
-            clipped_fraction=prepared.metrics.get("clipped_fraction"),
+            clipped_fraction=metrics.get("clip_fraction"),
             stale_fraction=(
                 1.0
                 - (
@@ -464,6 +525,14 @@ async def learner_main_loop(
             ),
             metrics=metrics,
             published_policy=published_policy,
+            metadata={
+                "published_policy_version": published_policy.policy_version if published_policy is not None else None,
+                "adopted_policy_version": (
+                    policy_adoption_controller.current_adopted_policy().policy_version
+                    if policy_adoption_controller is not None
+                    else inference_engine.current_policy().policy_version
+                ),
+            },
         )
         results.append(result)
         event_logger.log(
@@ -579,13 +648,66 @@ async def verified_group_collector_loop(
             completed_queue.task_done()
 
 
+async def policy_adoption_loop(
+    *,
+    controller: PolicyAdoptionController,
+    inference_engine: InferenceEngine,
+    stop_event: asyncio.Event,
+    event_logger: JsonlEventLogger,
+) -> None:
+    while True:
+        try:
+            policy = await asyncio.wait_for(controller.pending_queue.get(), timeout=0.05)
+        except asyncio.TimeoutError:
+            if stop_event.is_set() and controller.pending_queue.empty():
+                break
+            continue
+
+        try:
+            adoption_delay_ms = controller.adoption_delay_ms
+            if controller.adoption_jitter_ms > 0.0:
+                adoption_delay_ms += random.uniform(0.0, controller.adoption_jitter_ms)
+            if adoption_delay_ms > 0.0:
+                await asyncio.sleep(adoption_delay_ms / 1000.0)
+            await inference_engine.refresh_policy(policy)
+            await controller.mark_adopted(policy)
+            event_logger.log(
+                "PolicyAdopted",
+                policy_version=policy.policy_version,
+                payload={
+                    "policy_tag": policy.policy_tag,
+                    "published_policy_version": controller.current_published_policy().policy_version,
+                    "adopted_policy_version": controller.current_adopted_policy().policy_version,
+                    "adoption_delay_ms": adoption_delay_ms,
+                },
+            )
+        finally:
+            controller.pending_queue.task_done()
+
+
 async def policy_refresh_logic(
     *,
     actor_id: str,
     inference_engine: InferenceEngine,
     policy_store: LocalPolicyStore,
     event_logger: JsonlEventLogger,
+    policy_adoption_controller: PolicyAdoptionController | None = None,
 ) -> PolicyRef:
+    if policy_adoption_controller is not None:
+        adopted = policy_adoption_controller.current_adopted_policy()
+        published = policy_adoption_controller.current_published_policy()
+        if published.policy_version != adopted.policy_version:
+            event_logger.log(
+                "PolicyAdoptionLagObserved",
+                actor_id=actor_id,
+                policy_version=adopted.policy_version,
+                payload={
+                    "published_policy_version": published.policy_version,
+                    "adopted_policy_version": adopted.policy_version,
+                    "adoption_gap": published.policy_version - adopted.policy_version,
+                },
+            )
+        return adopted
     latest = policy_store.current_policy()
     if inference_engine.current_policy().policy_version != latest.policy_version:
         await inference_engine.refresh_policy(latest)

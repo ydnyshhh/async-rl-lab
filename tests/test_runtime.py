@@ -13,9 +13,11 @@ from async_rl_lab.objectives import GRPOObjective
 from async_rl_lab.policy_store import LocalPolicyStore
 from async_rl_lab.runtime import (
     LearnerConfig,
-    RoundRobinTaskSource,
     PendingVerifiedGroupAssembler,
+    PolicyAdoptionController,
+    RoundRobinTaskSource,
     learner_main_loop,
+    policy_adoption_loop,
     verified_group_collector_loop,
     verifier_loop,
 )
@@ -106,6 +108,51 @@ class RuntimeLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(policy_store.current_policy().policy_version, 1)
             self.assertGreater(results[0].gradient_norm or 0.0, 0.0)
             self.assertGreater(len(policy_store.current_state_snapshot().token_logits), 0)
+
+    async def test_async_policy_adoption_separates_publish_from_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            policy_store = LocalPolicyStore(root, run_id="run-test")
+            inference_engine = MockInferenceEngine(policy_store.current_policy(), policy_store=policy_store)
+            buffer = InMemoryGroupedRolloutBuffer(capacity_groups=2, required_group_size=2)
+            buffer.insert_group(
+                (
+                    make_trajectory("group-a", 0, 0, reward=1.0, answer_text="4"),
+                    make_trajectory("group-a", 1, 0, reward=0.0, answer_text="5"),
+                )
+            )
+            logger = JsonlEventLogger(root / "events.jsonl", run_id="run-test")
+            stop_event = asyncio.Event()
+            stop_event.set()
+            controller = PolicyAdoptionController(policy_store.current_policy(), adoption_delay_ms=50.0)
+
+            results = await learner_main_loop(
+                objective=GRPOObjective(),
+                rollout_buffer=buffer,
+                policy_store=policy_store,
+                inference_engine=inference_engine,
+                event_logger=logger,
+                stop_event=stop_event,
+                config=LearnerConfig(max_groups_per_batch=1, publish_every_steps=1, learning_rate=0.1),
+                max_steps=None,
+                policy_adoption_controller=controller,
+            )
+
+            self.assertEqual(len(results), 1)
+            self.assertEqual(policy_store.current_policy().policy_version, 1)
+            self.assertEqual(inference_engine.current_policy().policy_version, 0)
+            self.assertEqual(controller.current_published_policy().policy_version, 1)
+            self.assertEqual(controller.current_adopted_policy().policy_version, 0)
+
+            drain_stop_event = asyncio.Event()
+            drain_stop_event.set()
+            await policy_adoption_loop(
+                controller=controller,
+                inference_engine=inference_engine,
+                stop_event=drain_stop_event,
+                event_logger=logger,
+            )
+            self.assertEqual(inference_engine.current_policy().policy_version, 1)
 
     async def test_verifier_loop_and_collector_insert_completed_group(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

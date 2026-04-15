@@ -13,9 +13,11 @@ from async_rl_lab.policy_store import LocalPolicyStore
 from async_rl_lab.runtime import (
     ActorConfig,
     LearnerConfig,
+    PolicyAdoptionController,
     RoundRobinTaskSource,
     actor_main_loop,
     learner_main_loop,
+    policy_adoption_loop,
     verified_group_collector_loop,
     verifier_loop,
 )
@@ -27,6 +29,11 @@ async def run_demo() -> None:
     artifact_dir = Path("artifacts") / run_id
     policy_store = LocalPolicyStore(artifact_dir, run_id=run_id)
     inference_engine = MockInferenceEngine(policy_store.current_policy(), policy_store=policy_store)
+    adoption_controller = PolicyAdoptionController(
+        policy_store.current_policy(),
+        adoption_delay_ms=40.0,
+        adoption_jitter_ms=20.0,
+    )
     rollout_buffer = InMemoryGroupedRolloutBuffer(
         capacity_groups=8,
         required_group_size=4,
@@ -62,10 +69,19 @@ async def run_demo() -> None:
             stop_event=stop_event,
             config=ActorConfig(group_size=4, max_episode_steps=1),
             verifier_pending_queue=pending_verification_queue,
+            policy_adoption_controller=adoption_controller,
         )
         )
         for index in range(2)
     ]
+    adoption_task = asyncio.create_task(
+        policy_adoption_loop(
+            controller=adoption_controller,
+            inference_engine=inference_engine,
+            stop_event=stop_event,
+            event_logger=logger,
+        )
+    )
     verifier_task = asyncio.create_task(
         verifier_loop(
             verifier=verifier,
@@ -95,9 +111,11 @@ async def run_demo() -> None:
         stop_event=stop_event,
         config=LearnerConfig(max_groups_per_batch=1, publish_every_steps=1),
         max_steps=4,
+        policy_adoption_controller=adoption_controller,
     )
     stop_event.set()
     await asyncio.gather(*actor_tasks)
+    await adoption_task
     await verifier_task
     await collector_task
     await inference_engine.close()
