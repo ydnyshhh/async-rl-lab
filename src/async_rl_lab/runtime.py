@@ -34,6 +34,12 @@ class LearnerConfig:
     learning_rate: float = 0.05
 
 
+@dataclass(frozen=True, slots=True)
+class PendingPolicyAdoption:
+    actor_id: str
+    policy: PolicyRef
+
+
 class PolicyAdoptionController:
     def __init__(
         self,
@@ -41,31 +47,76 @@ class PolicyAdoptionController:
         *,
         adoption_delay_ms: float = 0.0,
         adoption_jitter_ms: float = 0.0,
+        actor_skew_step_ms: float = 0.0,
+        rollout_fraction: float = 1.0,
+        random_seed: int | None = 0,
     ) -> None:
         self.latest_published = initial_policy
-        self.latest_adopted = initial_policy
+        self.initial_policy = initial_policy
         self.adoption_delay_ms = adoption_delay_ms
         self.adoption_jitter_ms = adoption_jitter_ms
-        self.pending_queue: asyncio.Queue[PolicyRef] = asyncio.Queue()
+        self.actor_skew_step_ms = actor_skew_step_ms
+        self.rollout_fraction = rollout_fraction
+        self.random = random.Random(random_seed)
+        self.pending_queue: asyncio.Queue[PendingPolicyAdoption] = asyncio.Queue()
         self.lock = asyncio.Lock()
+        self.actor_order: dict[str, int] = {}
+        self.actor_adopted: dict[str, PolicyRef] = {}
+
+    async def register_actor(self, actor_id: str) -> None:
+        pending_policy: PolicyRef | None = None
+        async with self.lock:
+            if actor_id not in self.actor_order:
+                self.actor_order[actor_id] = len(self.actor_order)
+                self.actor_adopted[actor_id] = self.initial_policy
+                if self.latest_published.policy_version > self.initial_policy.policy_version:
+                    pending_policy = self.latest_published
+        if pending_policy is not None:
+            await self.pending_queue.put(PendingPolicyAdoption(actor_id=actor_id, policy=pending_policy))
 
     async def note_published(self, policy: PolicyRef) -> None:
         async with self.lock:
             self.latest_published = policy
-        await self.pending_queue.put(policy)
+            registered_actor_ids = tuple(self.actor_order)
+        if not registered_actor_ids:
+            return
+        selected_actor_ids = tuple(
+            actor_id
+            for actor_id in registered_actor_ids
+            if self.rollout_fraction >= 1.0 or self.random.random() <= self.rollout_fraction
+        )
+        if not selected_actor_ids:
+            selected_actor_ids = (min(registered_actor_ids, key=lambda actor_id: self.current_adopted_policy(actor_id).policy_version),)
+        for actor_id in selected_actor_ids:
+            await self.pending_queue.put(PendingPolicyAdoption(actor_id=actor_id, policy=policy))
 
-    async def mark_adopted(self, policy: PolicyRef) -> None:
+    async def mark_adopted(self, actor_id: str, policy: PolicyRef) -> None:
         async with self.lock:
-            self.latest_adopted = policy
+            self.actor_adopted[actor_id] = policy
 
     def current_published_policy(self) -> PolicyRef:
         return self.latest_published
 
-    def current_adopted_policy(self) -> PolicyRef:
-        return self.latest_adopted
+    def current_adopted_policy(self, actor_id: str) -> PolicyRef:
+        return self.actor_adopted.get(actor_id, self.initial_policy)
 
-    def adoption_gap(self) -> int:
-        return self.latest_published.policy_version - self.latest_adopted.policy_version
+    def min_adopted_policy_version(self) -> int:
+        if not self.actor_adopted:
+            return self.initial_policy.policy_version
+        return min(policy.policy_version for policy in self.actor_adopted.values())
+
+    def max_adopted_policy_version(self) -> int:
+        if not self.actor_adopted:
+            return self.initial_policy.policy_version
+        return max(policy.policy_version for policy in self.actor_adopted.values())
+
+    def adoption_gap(self, actor_id: str) -> int:
+        return self.latest_published.policy_version - self.current_adopted_policy(actor_id).policy_version
+
+    def actor_delay_ms(self, actor_id: str) -> float:
+        actor_rank = self.actor_order.get(actor_id, 0)
+        jitter_ms = self.random.uniform(0.0, self.adoption_jitter_ms) if self.adoption_jitter_ms > 0.0 else 0.0
+        return self.adoption_delay_ms + (actor_rank * self.actor_skew_step_ms) + jitter_ms
 
 
 class TaskSource(Protocol):
@@ -131,13 +182,20 @@ async def actor_main_loop(
     failed_episodes = 0
     task_iterator = iter(task_stream) if not hasattr(task_stream, "next_task") else None
     last_heartbeat_ts = 0.0
+    if policy_adoption_controller is not None:
+        await policy_adoption_controller.register_actor(actor_id)
 
     while not stop_event.is_set():
         now_ts = utc_ts()
         inference_metrics = inference_engine.metrics_snapshot()
         generation_latencies = inference_metrics.histograms.get("inference.latency_ms", ())
         queue_waits = inference_metrics.histograms.get("inference.queue_wait_ms", ())
-        served_policy_version = inference_engine.current_policy().policy_version
+        engine_loaded_policy_version = inference_engine.current_policy().policy_version
+        actor_adopted_policy_version = (
+            policy_adoption_controller.current_adopted_policy(actor_id).policy_version
+            if policy_adoption_controller is not None
+            else engine_loaded_policy_version
+        )
         published_policy_version = (
             policy_adoption_controller.current_published_policy().policy_version
             if policy_adoption_controller is not None
@@ -146,7 +204,7 @@ async def actor_main_loop(
         if now_ts - last_heartbeat_ts >= config.heartbeat_interval_s:
             heartbeat = ActorHeartbeat(
                 actor_id=actor_id,
-                current_policy_version=served_policy_version,
+                current_policy_version=actor_adopted_policy_version,
                 queue_depth=rollout_buffer.group_count(),
                 running_episodes=0,
                 completed_episodes=completed_episodes,
@@ -156,7 +214,8 @@ async def actor_main_loop(
                 mean_verifier_latency_ms=None,
                 metadata={
                     "published_policy_version": published_policy_version,
-                    "policy_version_gap": published_policy_version - served_policy_version,
+                    "engine_loaded_policy_version": engine_loaded_policy_version,
+                    "policy_version_gap": published_policy_version - actor_adopted_policy_version,
                     "mean_queue_wait_ms": mean_or_none(queue_waits),
                 },
             )
@@ -429,22 +488,35 @@ async def learner_main_loop(
         )
         prepared = objective.prepare_batch(batch)
         scoring_policy = policy_store.current_policy()
-        current_scores = policy_store.score_many(
-            [trajectory.raw_text for trajectory in batch.trajectories],
-            policy_version=scoring_policy.policy_version,
-        )
         reference_policy_version = scoring_policy.parent_policy_version or scoring_policy.policy_version
-        reference_scores = policy_store.score_many(
-            [trajectory.raw_text for trajectory in batch.trajectories],
-            policy_version=reference_policy_version,
-        )
+        current_turn_rows: list[tuple[tuple[float, ...], ...]] = []
+        current_sequence_logprobs: list[float] = []
+        reference_turn_rows: list[tuple[tuple[float, ...], ...]] = []
+        reference_sequence_logprobs: list[float] = []
+        for trajectory in batch.trajectories:
+            current_rows, current_sequence_logprob = score_trajectory_turns(
+                policy_store=policy_store,
+                trajectory=trajectory,
+                policy_version=scoring_policy.policy_version,
+            )
+            reference_rows, reference_sequence_logprob = score_trajectory_turns(
+                policy_store=policy_store,
+                trajectory=trajectory,
+                policy_version=reference_policy_version,
+            )
+            current_turn_rows.append(current_rows)
+            current_sequence_logprobs.append(current_sequence_logprob)
+            reference_turn_rows.append(reference_rows)
+            reference_sequence_logprobs.append(reference_sequence_logprob)
         rescored = RescoredBatch(
             current_policy_version=scoring_policy.policy_version,
             reference_policy_version=reference_policy_version,
-            current_token_logprobs=tuple(score.token_logprobs for score in current_scores),
-            current_sequence_logprobs=tuple(score.total_logprob for score in current_scores),
-            reference_token_logprobs=tuple(score.token_logprobs for score in reference_scores),
-            reference_sequence_logprobs=tuple(score.total_logprob for score in reference_scores),
+            current_token_logprobs=tuple(flatten_turn_logprobs(turn_rows) for turn_rows in current_turn_rows),
+            current_turn_token_logprobs=tuple(current_turn_rows),
+            current_sequence_logprobs=tuple(current_sequence_logprobs),
+            reference_token_logprobs=tuple(flatten_turn_logprobs(turn_rows) for turn_rows in reference_turn_rows),
+            reference_turn_token_logprobs=tuple(reference_turn_rows),
+            reference_sequence_logprobs=tuple(reference_sequence_logprobs),
         )
         objective_result = objective.compute_loss(prepared, rescored)
         update_stats = policy_store.train_on_sequences(
@@ -527,8 +599,13 @@ async def learner_main_loop(
             published_policy=published_policy,
             metadata={
                 "published_policy_version": published_policy.policy_version if published_policy is not None else None,
-                "adopted_policy_version": (
-                    policy_adoption_controller.current_adopted_policy().policy_version
+                "adopted_policy_version_floor": (
+                    policy_adoption_controller.min_adopted_policy_version()
+                    if policy_adoption_controller is not None
+                    else inference_engine.current_policy().policy_version
+                ),
+                "adopted_policy_version_ceiling": (
+                    policy_adoption_controller.max_adopted_policy_version()
                     if policy_adoption_controller is not None
                     else inference_engine.current_policy().policy_version
                 ),
@@ -657,28 +734,29 @@ async def policy_adoption_loop(
 ) -> None:
     while True:
         try:
-            policy = await asyncio.wait_for(controller.pending_queue.get(), timeout=0.05)
+            pending = await asyncio.wait_for(controller.pending_queue.get(), timeout=0.05)
         except asyncio.TimeoutError:
             if stop_event.is_set() and controller.pending_queue.empty():
                 break
             continue
 
         try:
-            adoption_delay_ms = controller.adoption_delay_ms
-            if controller.adoption_jitter_ms > 0.0:
-                adoption_delay_ms += random.uniform(0.0, controller.adoption_jitter_ms)
+            adoption_delay_ms = controller.actor_delay_ms(pending.actor_id)
             if adoption_delay_ms > 0.0:
                 await asyncio.sleep(adoption_delay_ms / 1000.0)
-            await inference_engine.refresh_policy(policy)
-            await controller.mark_adopted(policy)
+            await inference_engine.refresh_policy(pending.policy)
+            await controller.mark_adopted(pending.actor_id, pending.policy)
             event_logger.log(
-                "PolicyAdopted",
-                policy_version=policy.policy_version,
+                "PolicyActorAdopted",
+                actor_id=pending.actor_id,
+                policy_version=pending.policy.policy_version,
                 payload={
-                    "policy_tag": policy.policy_tag,
+                    "policy_tag": pending.policy.policy_tag,
                     "published_policy_version": controller.current_published_policy().policy_version,
-                    "adopted_policy_version": controller.current_adopted_policy().policy_version,
+                    "adopted_policy_version": controller.current_adopted_policy(pending.actor_id).policy_version,
                     "adoption_delay_ms": adoption_delay_ms,
+                    "fleet_min_adopted_version": controller.min_adopted_policy_version(),
+                    "fleet_max_adopted_version": controller.max_adopted_policy_version(),
                 },
             )
         finally:
@@ -694,7 +772,7 @@ async def policy_refresh_logic(
     policy_adoption_controller: PolicyAdoptionController | None = None,
 ) -> PolicyRef:
     if policy_adoption_controller is not None:
-        adopted = policy_adoption_controller.current_adopted_policy()
+        adopted = policy_adoption_controller.current_adopted_policy(actor_id)
         published = policy_adoption_controller.current_published_policy()
         if published.policy_version != adopted.policy_version:
             event_logger.log(
@@ -704,7 +782,7 @@ async def policy_refresh_logic(
                 payload={
                     "published_policy_version": published.policy_version,
                     "adopted_policy_version": adopted.policy_version,
-                    "adoption_gap": published.policy_version - adopted.policy_version,
+                    "adoption_gap": policy_adoption_controller.adoption_gap(actor_id),
                 },
             )
         return adopted
@@ -718,6 +796,28 @@ async def policy_refresh_logic(
             payload={"policy_tag": latest.policy_tag},
         )
     return latest
+
+
+def score_trajectory_turns(
+    *,
+    policy_store: LocalPolicyStore,
+    trajectory: Trajectory,
+    policy_version: int,
+) -> tuple[tuple[tuple[float, ...], ...], float]:
+    turn_texts = extract_turn_texts(trajectory)
+    turn_scores = policy_store.score_many(turn_texts, policy_version=policy_version)
+    turn_rows = tuple(tuple(score.token_logprobs) or (score.mean_logprob,) for score in turn_scores)
+    return turn_rows, sum(sum(row) for row in turn_rows)
+
+
+def extract_turn_texts(trajectory: Trajectory) -> tuple[str, ...]:
+    if trajectory.parsed_action_trace:
+        return tuple(action.raw_text for action in trajectory.parsed_action_trace)
+    return (trajectory.raw_text,)
+
+
+def flatten_turn_logprobs(turn_rows: tuple[tuple[float, ...], ...]) -> tuple[float, ...]:
+    return tuple(token for row in turn_rows for token in row)
 
 
 def mean_or_none(values) -> float | None:

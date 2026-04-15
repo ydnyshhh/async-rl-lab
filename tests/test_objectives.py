@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import unittest
 
+from async_rl_lab.models import Action
 from async_rl_lab.buffer import InMemoryGroupedRolloutBuffer
 from async_rl_lab.objectives import DAPOObjective, GRPOObjective, RescoredBatch, StalenessWeightedGRPO
 from tests.test_buffer import make_trajectory
@@ -54,8 +55,10 @@ class ObjectiveTests(unittest.TestCase):
             current_policy_version=1,
             reference_policy_version=0,
             current_token_logprobs=((1.0, 1.0), (-0.2, -0.2)),
+            current_turn_token_logprobs=(((1.0, 1.0),), ((-0.2, -0.2),)),
             current_sequence_logprobs=(2.0, -0.4),
             reference_token_logprobs=((0.0, 0.0), (0.0, 0.0)),
+            reference_turn_token_logprobs=(((0.0, 0.0),), ((0.0, 0.0),)),
             reference_sequence_logprobs=(0.0, 0.0),
         )
 
@@ -63,3 +66,31 @@ class ObjectiveTests(unittest.TestCase):
 
         self.assertGreater(result.metrics["clip_fraction"], 0.0)
         self.assertEqual(len(result.update_advantages), 2)
+
+    def test_prepare_batch_tracks_answer_and_tool_masks_by_turn(self) -> None:
+        base = make_trajectory("group-a", 0, 0, answer_text="4", expected_answer="4")
+        tool_action = Action(
+            action_id="action-tool",
+            action_type="tool_call",
+            raw_text='{"type":"tool_call","tool_name":"calculator","arguments":{"expression":"2 + 2"}}',
+            parsed_ts=0.0,
+            parser_status="ok",
+        )
+        finish_action = replace(base.parsed_action_trace[0], action_id="action-finish")
+        tool_transition = replace(base.transitions[0], action=tool_action)
+        finish_transition = replace(base.transitions[0], transition_id="tr-finish", action=finish_action)
+        trajectory = replace(
+            base,
+            parsed_action_trace=(tool_action, finish_action),
+            transitions=(tool_transition, finish_transition),
+            behavior_token_logprobs=((0.0, -0.1), (-0.2, -0.3)),
+        )
+        buffer = InMemoryGroupedRolloutBuffer(capacity_groups=1, required_group_size=1)
+        buffer.insert_group((trajectory,))
+        batch = buffer.sample_groups(max_groups=1, learner_policy_version=0)
+
+        prepared = GRPOObjective().prepare_batch(batch)
+
+        self.assertEqual(prepared.turn_action_types[0], ("tool_call", "finish"))
+        self.assertEqual(prepared.tool_turn_masks[0][0], (1, 1))
+        self.assertEqual(prepared.answer_turn_masks[0][1], (1, 1))

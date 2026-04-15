@@ -125,6 +125,7 @@ class RuntimeLoopTests(unittest.IsolatedAsyncioTestCase):
             stop_event = asyncio.Event()
             stop_event.set()
             controller = PolicyAdoptionController(policy_store.current_policy(), adoption_delay_ms=50.0)
+            await controller.register_actor("actor-0")
 
             results = await learner_main_loop(
                 objective=GRPOObjective(),
@@ -142,7 +143,7 @@ class RuntimeLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(policy_store.current_policy().policy_version, 1)
             self.assertEqual(inference_engine.current_policy().policy_version, 0)
             self.assertEqual(controller.current_published_policy().policy_version, 1)
-            self.assertEqual(controller.current_adopted_policy().policy_version, 0)
+            self.assertEqual(controller.current_adopted_policy("actor-0").policy_version, 0)
 
             drain_stop_event = asyncio.Event()
             drain_stop_event.set()
@@ -153,6 +154,49 @@ class RuntimeLoopTests(unittest.IsolatedAsyncioTestCase):
                 event_logger=logger,
             )
             self.assertEqual(inference_engine.current_policy().policy_version, 1)
+            self.assertEqual(controller.current_adopted_policy("actor-0").policy_version, 1)
+
+    async def test_partial_rollout_keeps_one_actor_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            policy_store = LocalPolicyStore(root, run_id="run-test")
+            logger = JsonlEventLogger(root / "events.jsonl", run_id="run-test")
+            inference_engine = MockInferenceEngine(policy_store.current_policy(), policy_store=policy_store)
+            updated = policy_store.train_on_sequences(
+                policy_version=policy_store.current_policy().policy_version,
+                sequences=['{"type":"finish","answer":"4"}'],
+                advantages=(1.0,),
+                sequence_weights=(1.0,),
+                learning_rate=0.1,
+            )
+            published = await policy_store.publish_policy(
+                checkpoint_step=1,
+                policy_tag="v1",
+                state=updated.updated_state,
+            )
+            controller = PolicyAdoptionController(
+                policy_store.load_policy(0) or policy_store.current_policy(),
+                rollout_fraction=0.5,
+                random_seed=0,
+            )
+            await controller.register_actor("actor-0")
+            await controller.register_actor("actor-1")
+            await controller.note_published(published)
+            stop_event = asyncio.Event()
+            stop_event.set()
+
+            await policy_adoption_loop(
+                controller=controller,
+                inference_engine=inference_engine,
+                stop_event=stop_event,
+                event_logger=logger,
+            )
+
+            adopted_versions = {
+                controller.current_adopted_policy("actor-0").policy_version,
+                controller.current_adopted_policy("actor-1").policy_version,
+            }
+            self.assertEqual(adopted_versions, {0, 1})
 
     async def test_verifier_loop_and_collector_insert_completed_group(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

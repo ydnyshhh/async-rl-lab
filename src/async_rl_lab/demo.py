@@ -33,6 +33,9 @@ async def run_demo() -> None:
         policy_store.current_policy(),
         adoption_delay_ms=40.0,
         adoption_jitter_ms=20.0,
+        actor_skew_step_ms=25.0,
+        rollout_fraction=0.75,
+        random_seed=7,
     )
     rollout_buffer = InMemoryGroupedRolloutBuffer(
         capacity_groups=8,
