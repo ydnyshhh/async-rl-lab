@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from typing import Callable, Protocol
+from typing import Callable, Literal, Protocol
 
 from async_rl_lab.ids import make_id, utc_ts
 from async_rl_lab.models import RewardResult, Trajectory
@@ -58,6 +58,7 @@ class ProgrammaticVerifier:
     async def verify(self, trajectory: Trajectory) -> RewardResult:
         started_ts = utc_ts()
         failure_tag = None
+        status: Literal["ok", "error", "timeout", "pending"]
         try:
             reward = float(self.scorer(trajectory))
             status = "ok"

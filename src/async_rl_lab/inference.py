@@ -9,7 +9,7 @@ import json
 import math
 import random
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol, TypedDict
 
 from async_rl_lab.ids import make_id, utc_ts
 from async_rl_lab.metrics import MetricsSnapshot, MetricsStore
@@ -45,6 +45,18 @@ class PendingGeneration:
     request: GenerationRequest
     future: asyncio.Future[GenerationResult]
     enqueue_ts: float
+
+
+class BackendGenerationOutput(TypedDict):
+    generated_text: str
+    prompt_tokens: int
+    completion_tokens: int
+    token_logprobs: tuple[float, ...]
+
+
+class HFBackendBundle(TypedDict):
+    tokenizer: Any
+    model: Any
 
 
 def parse_action_text(raw_text: str) -> Action:
@@ -346,8 +358,8 @@ class HFInferenceEngine:
         self.stop_event = asyncio.Event()
         self.worker_task: asyncio.Task[None] | None = None
         self.executor: ThreadPoolExecutor | None = self.create_executor()
-        self.loaded_model = None
-        self.loaded_tokenizer = None
+        self.loaded_model: Any | None = None
+        self.loaded_tokenizer: Any | None = None
         self.loaded_model_source: str | None = None
         self.last_refresh_latency_ms = 0.0
 
@@ -414,7 +426,7 @@ class HFInferenceEngine:
         self.metrics.increment("inference.batches")
         self.metrics.observe("inference.batch_size", float(len(batch)))
         prompt_texts = [self.render_prompt(pending.request) for pending in batch]
-        outputs = await asyncio.get_running_loop().run_in_executor(
+        outputs: list[BackendGenerationOutput] = await asyncio.get_running_loop().run_in_executor(
             self.ensure_executor(),
             self.generate_batch_sync,
             prompt_texts,
@@ -426,8 +438,8 @@ class HFInferenceEngine:
             ended_ts = utc_ts()
             queue_wait_ms = (dispatch_ts - pending.enqueue_ts) * 1000.0
             latency_ms = (ended_ts - dispatch_ts) * 1000.0
-            prompt_tokens = int(output["prompt_tokens"])
-            completion_tokens = int(output["completion_tokens"])
+            prompt_tokens = output["prompt_tokens"]
+            completion_tokens = output["completion_tokens"]
             self.metrics.observe("inference.queue_wait_ms", queue_wait_ms)
             self.metrics.observe("inference.latency_ms", latency_ms)
             self.metrics.observe("inference.prompt_tokens", float(prompt_tokens))
@@ -459,7 +471,7 @@ class HFInferenceEngine:
                 queue_wait_ms=queue_wait_ms,
                 latency_ms=latency_ms,
                 action=action,
-                token_logprobs=tuple(output.get("token_logprobs", ())),
+                token_logprobs=output["token_logprobs"],
                 metadata={
                     "engine_policy_version": self.loaded_policy.policy_version,
                     "served_policy_version": pending.request.policy.policy_version,
@@ -476,7 +488,7 @@ class HFInferenceEngine:
         if self.loaded_policy.policy_version == policy.policy_version and self.loaded_model_source == model_source:
             return 0.0
         started_ts = utc_ts()
-        bundle = await asyncio.get_running_loop().run_in_executor(
+        bundle: HFBackendBundle = await asyncio.get_running_loop().run_in_executor(
             self.ensure_executor(),
             load_hf_backend_bundle,
             model_source,
@@ -509,7 +521,11 @@ class HFInferenceEngine:
             return f"Tools: {tool_header}\n\n{request.observation_text}"
         return request.observation_text
 
-    def generate_batch_sync(self, prompt_texts: list[str], batch: list[PendingGeneration]) -> list[dict[str, object]]:
+    def generate_batch_sync(
+        self,
+        prompt_texts: list[str],
+        batch: list[PendingGeneration],
+    ) -> list[BackendGenerationOutput]:
         if self.loaded_model is None or self.loaded_tokenizer is None:
             raise RuntimeError("HFInferenceEngine model not loaded before generation")
         tokenizer = self.loaded_tokenizer
@@ -536,7 +552,7 @@ class HFInferenceEngine:
         input_width = int(inputs["input_ids"].shape[1])
         completion_ids = outputs[:, input_width:]
         decoded = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
-        results: list[dict[str, object]] = []
+        results: list[BackendGenerationOutput] = []
         for index, generated_text in enumerate(decoded):
             completion_tokens = sequence_length(completion_ids[index])
             prompt_tokens = sequence_length(inputs["attention_mask"][index])
@@ -616,21 +632,21 @@ def stable_request_seed(request: GenerationRequest) -> int:
     return sum(ord(char) for char in request.request_id) + (request.policy.policy_version * 1_009)
 
 
-def load_hf_backend_bundle(model_source: str, device: str) -> dict[str, object]:
+def load_hf_backend_bundle(model_source: str, device: str) -> HFBackendBundle:
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError as exc:
         raise RuntimeError(
             "HFInferenceEngine requires transformers to be installed. Add the optional hf dependencies and sync the environment."
         ) from exc
-    torch = load_torch_module()
+    load_torch_module()
     tokenizer = AutoTokenizer.from_pretrained(model_source)
     if getattr(tokenizer, "pad_token_id", None) is None:
         tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(model_source)
     model.to(device)
     model.eval()
-    return {"tokenizer": tokenizer, "model": model, "torch": torch}
+    return {"tokenizer": tokenizer, "model": model}
 
 
 def load_torch_module():
