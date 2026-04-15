@@ -24,21 +24,6 @@ It helps you study:
 
 If you are new to async RL, the main educational value is that the code makes timing and provenance visible. You can inspect when a rollout was generated, which policy produced it, when reward arrived, when it entered the queue, and which learner version eventually consumed it.
 
-## What This Repo Is Not
-
-This project is intentionally honest about its current scope.
-
-| In scope today | Not the goal today |
-| --- | --- |
-| Single-process `asyncio` runtime | Distributed cluster orchestration |
-| Local grouped rollout buffer | Production replay infrastructure |
-| Explicit policy publication and adoption | Hidden trainer-managed policy refresh |
-| Mock inference and a minimal HF backend | Full high-throughput serving stack |
-| Educational GRPO-family objectives | Benchmark-grade transformer post-training |
-| Lightweight local sequence policy backend | Full neural optimizer / optimizer-state stack |
-
-The learner path is more structured than a toy scalar demo, but it still updates a lightweight local sequence policy rather than a real transformer training graph. That is deliberate. This repo is best understood as an async RL mechanics lab, not a miniature production LLM post-training system.
-
 ## Main Focus Areas
 
 - policy lag
@@ -154,33 +139,6 @@ This lab is useful if you want to answer questions like:
 - Why is inference better modeled as a serving subsystem than a helper function?
 - How should policy publication differ from policy adoption?
 - What is the smallest setup where GRPO-family post-training starts to feel different from classic synchronous RL?
-
-## Current Design Style
-
-The codebase aims to be:
-
-- explicit rather than magical
-- small enough to read end-to-end
-- technical but beginner-friendly
-- honest about approximations
-- useful for local experiments
-
-Two examples of that honesty:
-
-- The objective path is turn-aware and token-masked, but it is still educational in spirit and not a full audited production post-training math stack.
-- The policy backend supports masked turn-level updates, but it is still a lightweight local sequence policy rather than a transformer optimizer.
-
-Those tradeoffs are intentional. The repo tries to teach async RL system mechanics clearly before it tries to look large or impressive.
-
-## If You Want To Extend It
-
-Reasonable next experiments include:
-
-- plugging a real neural training backend under the current learner/objective interfaces
-- making role masks even finer inside turns
-- adding richer delayed-verifier experiments
-- expanding actor-local serving heterogeneity
-- implementing the planned `vLLM` backend
 
 ## Further Reading
 
